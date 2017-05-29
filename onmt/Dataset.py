@@ -11,7 +11,7 @@ import onmt
 
 class Dataset(object):
 
-    def __init__(self, srcData, tgtData, batchSize, cuda, volatile=False):
+    def __init__(self, srcData, tgtData, batchSize, cuda, volatile=False, sortBuffer=True, bufferRatio=10):
         self.src = srcData
         if tgtData:
             self.tgt = tgtData
@@ -21,8 +21,10 @@ class Dataset(object):
         self.cuda = cuda
 
         self.batchSize = batchSize
-        self.numBatches = math.ceil(len(self.src)/batchSize)
+        self.bufferSize = batchSize * bufferRatio
+        self.numBatches = math.ceil(len(self.src)/float(batchSize))
         self.volatile = volatile
+        self.sortBuffer = sortBuffer
 
     def _batchify(self, data, align_right=False, include_lengths=False):
         lengths = [x.size(0) for x in data]
@@ -38,15 +40,16 @@ class Dataset(object):
         else:
             return out
 
+
     def __getitem__(self, index):
         assert index < self.numBatches, "%d > %d" % (index, self.numBatches)
         srcBatch, lengths = self._batchify(
-            self.src[index*self.batchSize:(index+1)*self.batchSize],
+            self.src[index*self.batchSize:min((index+1)*self.batchSize, len(self.src))],
             align_right=False, include_lengths=True)
 
         if self.tgt:
             tgtBatch = self._batchify(
-                self.tgt[index*self.batchSize:(index+1)*self.batchSize])
+                self.tgt[index*self.batchSize:min((index+1)*self.batchSize, len(self.tgt))])
         else:
             tgtBatch = None
 
@@ -76,4 +79,10 @@ class Dataset(object):
 
     def shuffle(self):
         data = list(zip(self.src, self.tgt))
-        self.src, self.tgt = zip(*[data[i] for i in torch.randperm(len(data))])
+        data = [data[i] for i in torch.randperm(len(data))]
+        if self.sortBuffer:
+           numBuffers = math.ceil(len(data)/float(self.bufferSize))
+           for i in range(numBuffers):
+               higherb = min(i*bufferSize, len(data))
+               data[i*self.bufferSize:higherb] = sorted(data[i*self.bufferSize], key=lambda x: -len(x[0]))
+        self.src, self.tgt = zip(*data)

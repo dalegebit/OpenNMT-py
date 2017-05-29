@@ -28,9 +28,9 @@ parser.add_argument('-train_from', default='', type=str,
 
 parser.add_argument('-layers', type=int, default=2,
                     help='Number of layers in the LSTM encoder/decoder')
-parser.add_argument('-rnn_size', type=int, default=500,
+parser.add_argument('-rnn_size', type=int, default=512,
                     help='Size of LSTM hidden states')
-parser.add_argument('-word_vec_size', type=int, default=500,
+parser.add_argument('-word_vec_size', type=int, default=512,
                     help='Word embedding sizes')
 parser.add_argument('-input_feed', type=int, default=1,
                     help="""Feed the context vector at each time step as
@@ -46,7 +46,7 @@ parser.add_argument('-brnn_merge', default='concat',
 
 ## Optimization options
 
-parser.add_argument('-batch_size', type=int, default=64,
+parser.add_argument('-batch_size', type=int, default=128,
                     help='Maximum batch size')
 parser.add_argument('-max_generator_batches', type=int, default=32,
                     help="""Maximum batches of words in a sequence to run
@@ -59,7 +59,7 @@ parser.add_argument('-start_epoch', type=int, default=1,
 parser.add_argument('-param_init', type=float, default=0.1,
                     help="""Parameters are initialized over uniform distribution
                     with support (-param_init, param_init)""")
-parser.add_argument('-optim', default='sgd',
+parser.add_argument('-optim', default='adadelta',
                     help="Optimization method. [sgd|adagrad|adadelta|adam]")
 parser.add_argument('-max_grad_norm', type=float, default=5,
                     help="""If the norm of the gradient vector exceeds this,
@@ -286,7 +286,7 @@ def main():
     print('Building model...')
 
     encoder = onmt.Models.Encoder(opt, dicts['src'])
-    decoder = onmt.Models.Decoder(opt, dicts['tgt'])
+    decoder = onmt.Models.DecoderWithMultiAttn(opt, dicts['tgt'])
 
     generator = nn.Sequential(
         nn.Linear(opt.rnn_size, dicts['tgt'].size()),

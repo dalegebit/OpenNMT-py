@@ -65,6 +65,42 @@ class StackedLSTM(nn.Module):
 
         return input, (h_1, c_1)
 
+class StackedLSTMWithMultiAttn(nn.Module):
+    def __init__(self, num_layers, input_size, rnn_size, dropout):
+        super(StackedLSTMWithMultiAttn, self).__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList()
+        self.attns = nn.ModuleList()
+
+        in_size = input_size
+        for i in range(num_layers):
+            self.layers.append(nn.LSTMCell(in_size, rnn_size))
+            in_size = rnn_size
+
+        for i in range(num_layers):
+            self.attns.append(onmt.modules.GlobalAttention(rnn_size))
+
+    def forward(self, input, hidden, context):
+        h_0, c_0 = hidden
+        h_1, c_1, a_1 = [], [], []
+        for i, (layer, attn) in enumerate(zip(self.layers, self.attns)):
+            h_1_i, c_1_i = layer(input, (h_0[i], c_0[i]))
+            _, context_1_i, attnWeight_1_i = attn(h_1_i, context.t())
+            h_1_i = h_1_i + context_1_i
+            input = h_1_i
+            if i != self.num_layers:
+                input = self.dropout(input)
+            h_1 += [h_1_i]
+            c_1 += [c_1_i]
+            a_1 += [attnWeight_1_i]
+
+        h_1 = torch.stack(h_1)
+        c_1 = torch.stack(c_1)
+        a_1 = torch.stack(a_1)
+
+        return input, (h_1, c_1), a_1
+
 
 class Decoder(nn.Module):
 
@@ -104,12 +140,60 @@ class Decoder(nn.Module):
                 emb_t = torch.cat([emb_t, output], 1)
 
             output, hidden = self.rnn(emb_t, hidden)
-            output, attn = self.attn(output, context.t())
+            output, _, attn = self.attn(output, context.t())
             output = self.dropout(output)
             outputs += [output]
 
         outputs = torch.stack(outputs)
         return outputs, hidden, attn
+
+
+
+class DecoderWithMultiAttn(nn.Module):
+
+    def __init__(self, opt, dicts):
+        self.layers = opt.layers
+        self.input_feed = opt.input_feed
+        input_size = opt.word_vec_size
+        if self.input_feed:
+            input_size += opt.rnn_size
+
+        super(DecoderWithMultiAttn, self).__init__()
+        self.word_lut = nn.Embedding(dicts.size(),
+                                  opt.word_vec_size,
+                                  padding_idx=onmt.Constants.PAD)
+        self.rnn = StackedLSTMWithMultiAttn(opt.layers, input_size, opt.rnn_size, opt.dropout)
+        self.attn = onmt.modules.GlobalAttention(opt.rnn_size)
+        self.dropout = nn.Dropout(opt.dropout)
+
+        self.hidden_size = opt.rnn_size
+
+        if opt.pre_word_vecs_enc is not None:
+            pretrained = torch.load(opt.pre_word_vecs_dec)
+            self.word_lut.weight.copy_(pretrained)
+
+
+    def forward(self, input, hidden, context, init_output):
+        emb = self.word_lut(input)
+
+        # n.b. you can increase performance if you compute W_ih * x for all
+        # iterations in parallel, but that's only possible if
+        # self.input_feed=False
+        outputs = []
+        output = init_output
+        for emb_t in emb.split(1):
+            emb_t = emb_t.squeeze(0)
+            if self.input_feed:
+                emb_t = torch.cat([emb_t, output], 1)
+
+            output, hidden, _ = self.rnn(emb_t, hidden, context)
+            output, _, attn = self.attn(output, context.t())
+            output = self.dropout(output)
+            outputs += [output]
+
+        outputs = torch.stack(outputs)
+        return outputs, hidden, attn
+
 
 
 class NMTModel(nn.Module):
