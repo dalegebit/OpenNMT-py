@@ -15,6 +15,8 @@ class Optim(object):
             self.optimizer = optim.Adadelta(self.params, lr=self.lr)
         elif self.method == 'adam':
             self.optimizer = optim.Adam(self.params, lr=self.lr)
+        elif self.method == 'rmsprop':
+            self.optimizer = optim.RMSprop(self.params, lr=self.lr)
         else:
             raise RuntimeError("Invalid optim method: " + self.method)
 
@@ -46,3 +48,13 @@ class Optim(object):
 
         self.last_ppl = ppl
         self.optimizer.param_groups[0]['lr'] = self.lr
+
+    def setLearningRate(self, lr):
+        self.lr = lr
+        self.optimizer.param_groups[0]['lr'] = lr
+
+    def setStartDecay(self, start_decay_at):
+        self.start_decay_at = start_decay_at
+
+    def setMethod(self, method):
+        self.method = method

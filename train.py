@@ -1,3 +1,5 @@
+from __future__ import division
+
 import onmt
 import argparse
 import torch
@@ -43,10 +45,15 @@ parser.add_argument('-brnn', action='store_true',
 parser.add_argument('-brnn_merge', default='concat',
                     help="""Merge action for the bidirectional hidden states:
                     [concat|sum]""")
-
+parser.add_argument('-attn_use_emb', action='store_true',
+                    help="""Use source embeddings in attention
+                    """)
+parser.add_argument('-sync_decode_emb', action='store_true',
+                    help="""Synchronize the generator weight with the embedding
+                    in decoder""")
 ## Optimization options
 
-parser.add_argument('-batch_size', type=int, default=128,
+parser.add_argument('-batch_size', type=int, default=64,
                     help='Maximum batch size')
 parser.add_argument('-max_generator_batches', type=int, default=32,
                     help="""Maximum batches of words in a sequence to run
@@ -207,7 +214,7 @@ def trainModel(model, trainData, validData, dataset, optim):
             report_loss += loss
             report_num_correct += num_correct
             report_tgt_words += num_words
-            report_src_words += sum(batch[0][1])
+            report_src_words += batch[0][1].data.sum()
             total_loss += loss
             total_num_correct += num_correct
             total_words += num_words
@@ -232,7 +239,7 @@ def trainModel(model, trainData, validData, dataset, optim):
         train_loss, train_acc = trainEpoch(epoch)
         train_ppl = math.exp(min(train_loss, 100))
         print('Train perplexity: %g' % train_ppl)
-        print('Train accuracy: %g' % train_acc)
+        print('Train accuracy: %g' % (train_acc*100))
 
         #  (2) evaluate on the validation set
         valid_loss, valid_acc = eval(model, criterion, validData)
@@ -241,11 +248,12 @@ def trainModel(model, trainData, validData, dataset, optim):
         print('Validation accuracy: %g' % (valid_acc*100))
 
         #  (3) update the learning rate
-        optim.updateLearningRate(valid_loss, epoch)
+        optim.updateLearningRate(valid_ppl, epoch)
 
         model_state_dict = model.module.state_dict() if len(opt.gpus) > 1 else model.state_dict()
         model_state_dict = {k: v for k, v in model_state_dict.items() if 'generator' not in k}
         generator_state_dict = model.generator.module.state_dict() if len(opt.gpus) > 1 else model.generator.state_dict()
+        optim_state_dict = optim.optimizer.state_dict()
         #  (4) drop a checkpoint
         checkpoint = {
             'model': model_state_dict,
@@ -253,7 +261,7 @@ def trainModel(model, trainData, validData, dataset, optim):
             'dicts': dataset['dicts'],
             'opt': opt,
             'epoch': epoch,
-            'optim': optim
+            'optim': (optim, optim_state_dict),
         }
         torch.save(checkpoint,
                    '%s_acc_%.2f_ppl_%.2f_e%d.pt' % (opt.save_model, 100*valid_acc, valid_ppl, epoch))
@@ -269,7 +277,10 @@ def main():
         print('Loading dicts from checkpoint at %s' % dict_checkpoint)
         checkpoint = torch.load(dict_checkpoint)
         dataset['dicts'] = checkpoint['dicts']
+        old_opt = checkpoint['opt']
 
+    cur_opt = old_opt if dict_checkpoint else opt
+ 
     trainData = onmt.Dataset(dataset['train']['src'],
                              dataset['train']['tgt'], opt.batch_size, opt.gpus)
     validData = onmt.Dataset(dataset['valid']['src'],
@@ -285,14 +296,17 @@ def main():
 
     print('Building model...')
 
-    encoder = onmt.Models.Encoder(opt, dicts['src'])
-    decoder = onmt.Models.DecoderWithMultiAttn(opt, dicts['tgt'])
+    encoder = onmt.Models.Encoder(cur_opt, dicts['src'])
+    decoder = onmt.Models.DecoderWithMultiAttn(cur_opt, dicts['tgt'])
 
     generator = nn.Sequential(
-        nn.Linear(opt.rnn_size, dicts['tgt'].size()),
+        nn.Linear(cur_opt.rnn_size, dicts['tgt'].size()),
         nn.LogSoftmax())
 
-    model = onmt.Models.NMTModel(encoder, decoder)
+    if opt.sync_decode_emb:
+        generator.weight = decoder.word_lut.weight
+
+    model = onmt.Models.NMTModel(encoder, decoder, cur_opt.attn_use_emb)
 
     if opt.train_from:
         print('Loading model from checkpoint at %s' % opt.train_from)
@@ -322,24 +336,37 @@ def main():
 
     model.generator = generator
 
+
     if not opt.train_from_state_dict and not opt.train_from:
         for p in model.parameters():
             p.data.uniform_(-opt.param_init, opt.param_init)
 
+        encoder.load_pretrained_vectors(opt)
+        decoder.load_pretrained_vectors(opt)
         optim = onmt.Optim(
             opt.optim, opt.learning_rate, opt.max_grad_norm,
             lr_decay=opt.learning_rate_decay,
             start_decay_at=opt.start_decay_at
         )
+
     else:
         print('Loading optimizer from checkpoint:')
-        optim = checkpoint['optim']
+        optim = checkpoint['optim'][0]
+        if opt.learning_rate != parser.get_default('learning_rate'):
+            optim.setLearningRate(opt.learning_rate)
+        if opt.start_decay_at > parser.get_default('start_decay_at'):
+            optim.setStartDecay(opt.start_decay_at)
+        if opt.optim != parser.get_default('optim'):
+            optim.setMethod(opt.optim)
         print(optim)
+
 
     optim.set_parameters(model.parameters())
 
-    if opt.train_from or opt.train_from_state_dict:
-        optim.optimizer.load_state_dict(checkpoint['optim'].optimizer.state_dict())
+    if (opt.train_from or opt.train_from_state_dict) and \
+            opt.optim == optim.method:
+        # print checkpoint['optim'][1]
+        optim.optimizer.load_state_dict(checkpoint['optim'][1])
 
     nParams = sum([p.nelement() for p in model.parameters()])
     print('* number of parameters: %d' % nParams)

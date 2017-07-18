@@ -16,8 +16,8 @@ class Translator(object):
         self.tgt_dict = checkpoint['dicts']['tgt']
 
         encoder = onmt.Models.Encoder(model_opt, self.src_dict)
-        decoder = onmt.Models.Decoder(model_opt, self.tgt_dict)
-        model = onmt.Models.NMTModel(encoder, decoder)
+        decoder = onmt.Models.DecoderWithMultiAttn(model_opt, self.tgt_dict)
+        model = onmt.Models.NMTModel(encoder, decoder, model_opt.attn_use_emb)
 
         generator = nn.Sequential(
             nn.Linear(model_opt.rnn_size, self.tgt_dict.size()),
@@ -50,7 +50,7 @@ class Translator(object):
                        onmt.Constants.EOS_WORD) for b in goldBatch]
 
         return onmt.Dataset(srcData, tgtData,
-            self.opt.batch_size, self.opt.cuda)
+            self.opt.batch_size, self.opt.cuda, volatile=True)
 
     def buildTargetTokens(self, pred, src, attn):
         tokens = self.tgt_dict.convertToLabels(pred, onmt.Constants.EOS)
@@ -67,7 +67,11 @@ class Translator(object):
         beamSize = self.opt.beam_size
 
         #  (1) run the encoder on the src
-        encStates, context = self.model.encoder(srcBatch)
+        if self.model.attn_use_emb:
+            encStates, context, emb = self.model.encoder(srcBatch)
+        else:
+            encStates, context= self.model.encoder(srcBatch)
+
         srcBatch = srcBatch[0] # drop the lengths needed for encoder
 
         rnnSize = context.size(2)
@@ -90,8 +94,13 @@ class Translator(object):
             self.model.decoder.apply(applyContextMask)
             initOutput = self.model.make_init_decoder_output(context)
 
-            decOut, decStates, attn = self.model.decoder(
-                tgtBatch[:-1], decStates, context, initOutput)
+            if self.model.attn_use_emb:
+                decOut, decStates, attn = self.model.decoder(
+                    tgtBatch[:-1], decStates, context, initOutput, emb)
+            else:
+                decOut, decStates, attn = self.model.decoder(
+                    tgtBatch[:-1], decStates, context, initOutput)
+
             for dec_t, tgt_t in zip(decOut, tgtBatch[1:].data):
                 gen_t = self.model.generator.forward(dec_t)
                 tgt_t = tgt_t.unsqueeze(1)
@@ -102,9 +111,12 @@ class Translator(object):
         #  (3) run the decoder to generate sentences, using beam search
 
         # Expand tensors for each beam.
-        context = Variable(context.data.repeat(1, beamSize, 1), volatile=True)
-        decStates = (Variable(encStates[0].data.repeat(1, beamSize, 1), volatile=True),
-                     Variable(encStates[1].data.repeat(1, beamSize, 1), volatile=True))
+        context = Variable(context.data.repeat(1, beamSize, 1))
+        decStates = (Variable(encStates[0].data.repeat(1, beamSize, 1)),
+                     Variable(encStates[1].data.repeat(1, beamSize, 1)))
+
+        if self.model.attn_use_emb:
+            emb = Variable(emb.data.repeat(1, beamSize, 1))
 
         beam = [onmt.Beam(beamSize, self.opt.cuda) for k in range(batchSize)]
 
@@ -122,8 +134,13 @@ class Translator(object):
             input = torch.stack([b.getCurrentState() for b in beam
                                if not b.done]).t().contiguous().view(1, -1)
 
-            decOut, decStates, attn = self.model.decoder(
-                Variable(input, volatile=True), decStates, context, decOut)
+            if self.model.attn_use_emb:
+                decOut, decStates, attn = self.model.decoder(
+                    Variable(input, volatile=True), decStates, context, decOut, emb)
+            else:
+                decOut, decStates, attn = self.model.decoder(
+                    Variable(input, volatile=True), decStates, context, decOut)
+
             # decOut: 1 x (beam*batch) x numWords
             decOut = decOut.squeeze(0)
             out = self.model.generator.forward(decOut)
@@ -167,6 +184,7 @@ class Translator(object):
             decStates = (updateActive(decStates[0]), updateActive(decStates[1]))
             decOut = updateActive(decOut)
             context = updateActive(context)
+            emb = updateActive(emb)
             padMask = padMask.index_select(1, activeIdx)
 
             remainingSents = len(active)
@@ -195,6 +213,7 @@ class Translator(object):
 
         #  (2) translate
         pred, predScore, attn, goldScore = self.translateBatch(src, tgt)
+        pred, predScore, attn, goldScore = list(zip(*sorted(zip(pred, predScore, attn, goldScore, indices), key=lambda x: x[-1])))[:-1]
 
         #  (3) convert indexes to words
         predBatch = []
@@ -204,4 +223,4 @@ class Translator(object):
                         for n in range(self.opt.n_best)]
             )
 
-        return list(zip(*sorted(zip(predBatch, predScore, goldScore, indices), key=lambda x: x[-1])))[:-1]
+        return predBatch, predScore, goldScore

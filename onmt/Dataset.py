@@ -22,7 +22,7 @@ class Dataset(object):
 
         self.batchSize = batchSize
         self.bufferSize = batchSize * bufferRatio
-        self.numBatches = math.ceil(len(self.src)/float(batchSize))
+        self.numBatches = int(math.ceil(len(self.src)/float(batchSize)))
         self.volatile = volatile
         self.sortBuffer = sortBuffer
 
@@ -71,6 +71,10 @@ class Dataset(object):
             b = Variable(b, volatile=self.volatile)
             return b
 
+        # wrap lengths in a Variable to properly split it in DataParallel
+        lengths = torch.LongTensor(lengths).view(1, -1)
+        lengths = Variable(lengths, volatile=self.volatile)
+
         return (wrap(srcBatch), lengths), wrap(tgtBatch), indices
 
     def __len__(self):
@@ -81,8 +85,8 @@ class Dataset(object):
         data = list(zip(self.src, self.tgt))
         data = [data[i] for i in torch.randperm(len(data))]
         if self.sortBuffer:
-           numBuffers = math.ceil(len(data)/float(self.bufferSize))
+           numBuffers = int(math.ceil(len(data)/float(self.bufferSize)))
            for i in range(numBuffers):
-               higherb = min(i*bufferSize, len(data))
-               data[i*self.bufferSize:higherb] = sorted(data[i*self.bufferSize], key=lambda x: -len(x[0]))
+               higherb = min(i*self.bufferSize, len(data))
+               data[i*self.bufferSize:higherb] = sorted(data[i*self.bufferSize:higherb], key=lambda x: -len(x[0]))
         self.src, self.tgt = zip(*data)
