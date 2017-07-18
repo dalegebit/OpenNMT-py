@@ -22,20 +22,28 @@ class Encoder(nn.Module):
                         num_layers=opt.layers,
                         dropout=opt.dropout,
                         bidirectional=opt.brnn)
+        self.attn_use_emb = opt.attn_use_emb
 
+    def load_pretrained_vectors(self, opt):
         if opt.pre_word_vecs_enc is not None:
             pretrained = torch.load(opt.pre_word_vecs_enc)
-            self.word_lut.weight.copy_(pretrained)
+            self.word_lut.weight.data.copy_(pretrained)
 
     def forward(self, input, hidden=None):
         if isinstance(input, tuple):
-            emb = pack(self.word_lut(input[0]), input[1])
+            lengths = input[1].data.view(-1).tolist() # lengths data is wrapped inside a Variable
+            emb = pack(self.word_lut(input[0]), lengths)
         else:
             emb = self.word_lut(input)
         outputs, hidden_t = self.rnn(emb, hidden)
         if isinstance(input, tuple):
             outputs = unpack(outputs)[0]
-        return hidden_t, outputs
+            if self.attn_use_emb:
+                emb = unpack(emb)[0]
+        if self.attn_use_emb:
+            return hidden_t, outputs, emb
+        else:
+            return hidden_t, outputs
 
 
 class StackedLSTM(nn.Module):
@@ -55,7 +63,7 @@ class StackedLSTM(nn.Module):
         for i, layer in enumerate(self.layers):
             h_1_i, c_1_i = layer(input, (h_0[i], c_0[i]))
             input = h_1_i
-            if i != self.num_layers:
+            if i + 1 != self.num_layers:
                 input = self.dropout(input)
             h_1 += [h_1_i]
             c_1 += [c_1_i]
@@ -66,27 +74,36 @@ class StackedLSTM(nn.Module):
         return input, (h_1, c_1)
 
 class StackedLSTMWithMultiAttn(nn.Module):
-    def __init__(self, num_layers, input_size, rnn_size, dropout):
+    def __init__(self, num_layers, input_size, rnn_size, dropout, use_emb=False):
         super(StackedLSTMWithMultiAttn, self).__init__()
         self.dropout = nn.Dropout(dropout)
         self.num_layers = num_layers
         self.layers = nn.ModuleList()
         self.attns = nn.ModuleList()
+        self.use_emb = use_emb
 
         in_size = input_size
         for i in range(num_layers):
             self.layers.append(nn.LSTMCell(in_size, rnn_size))
             in_size = rnn_size
 
-        for i in range(num_layers):
-            self.attns.append(onmt.modules.GlobalAttention(rnn_size))
+        if use_emb:
+            for i in range(num_layers):
+                self.attns.append(onmt.modules.GlobalKeyValueAttention(rnn_size))
+        else:
+            for i in range(num_layers):
+                self.attns.append(onmt.modules.GlobalAttention(rnn_size))
 
-    def forward(self, input, hidden, context):
+
+    def forward(self, input, hidden, context, embedding=None):
         h_0, c_0 = hidden
         h_1, c_1, a_1 = [], [], []
         for i, (layer, attn) in enumerate(zip(self.layers, self.attns)):
             h_1_i, c_1_i = layer(input, (h_0[i], c_0[i]))
-            _, context_1_i, attnWeight_1_i = attn(h_1_i, context.t())
+            if self.use_emb:
+                _, context_1_i, attnWeight_1_i = attn(h_1_i, context.t(), embedding.t())
+            else:
+                _, context_1_i, attnWeight_1_i = attn(h_1_i, context.t())
             h_1_i = h_1_i + context_1_i
             input = h_1_i
             if i != self.num_layers:
@@ -121,10 +138,10 @@ class Decoder(nn.Module):
 
         self.hidden_size = opt.rnn_size
 
-        if opt.pre_word_vecs_enc is not None:
+    def load_pretrained_vectors(self, opt):
+        if opt.pre_word_vecs_dec is not None:
             pretrained = torch.load(opt.pre_word_vecs_dec)
-            self.word_lut.weight.copy_(pretrained)
-
+            self.word_lut.weight.data.copy_(pretrained)
 
     def forward(self, input, hidden, context, init_output):
         emb = self.word_lut(input)
@@ -162,9 +179,10 @@ class DecoderWithMultiAttn(nn.Module):
         self.word_lut = nn.Embedding(dicts.size(),
                                   opt.word_vec_size,
                                   padding_idx=onmt.Constants.PAD)
-        self.rnn = StackedLSTMWithMultiAttn(opt.layers, input_size, opt.rnn_size, opt.dropout)
+        self.rnn = StackedLSTMWithMultiAttn(opt.layers, input_size, opt.rnn_size, opt.dropout, opt.attn_use_emb) # use emb
         self.attn = onmt.modules.GlobalAttention(opt.rnn_size)
         self.dropout = nn.Dropout(opt.dropout)
+        self.attn_use_emb = opt.attn_use_emb
 
         self.hidden_size = opt.rnn_size
 
@@ -172,8 +190,12 @@ class DecoderWithMultiAttn(nn.Module):
             pretrained = torch.load(opt.pre_word_vecs_dec)
             self.word_lut.weight.copy_(pretrained)
 
+    def load_pretrained_vectors(self, opt):
+        if opt.pre_word_vecs_dec is not None:
+            pretrained = torch.load(opt.pre_word_vecs_dec)
+            self.word_lut.weight.data.copy_(pretrained)
 
-    def forward(self, input, hidden, context, init_output):
+    def forward(self, input, hidden, context, init_output, src_emb=None):
         emb = self.word_lut(input)
 
         # n.b. you can increase performance if you compute W_ih * x for all
@@ -186,7 +208,11 @@ class DecoderWithMultiAttn(nn.Module):
             if self.input_feed:
                 emb_t = torch.cat([emb_t, output], 1)
 
-            output, hidden, _ = self.rnn(emb_t, hidden, context)
+            if self.attn_use_emb:
+                output, hidden, _ = self.rnn(emb_t, hidden, context, src_emb)
+            else:
+                output, hidden, _ = self.rnn(emb_t, hidden, context)
+
             output, _, attn = self.attn(output, context.t())
             output = self.dropout(output)
             outputs += [output]
@@ -198,10 +224,11 @@ class DecoderWithMultiAttn(nn.Module):
 
 class NMTModel(nn.Module):
 
-    def __init__(self, encoder, decoder):
+    def __init__(self, encoder, decoder, attn_use_emb):
         super(NMTModel, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.attn_use_emb = attn_use_emb
 
     def make_init_decoder_output(self, context):
         batch_size = context.size(1)
@@ -221,12 +248,34 @@ class NMTModel(nn.Module):
     def forward(self, input):
         src = input[0]
         tgt = input[1][:-1]  # exclude last target from inputs
-        enc_hidden, context = self.encoder(src)
+
+        if self.attn_use_emb:
+            enc_hidden, context, emb = self.encoder(src)
+        else:
+            enc_hidden, context = self.encoder(src)
+
         init_output = self.make_init_decoder_output(context)
 
         enc_hidden = (self._fix_enc_hidden(enc_hidden[0]),
                       self._fix_enc_hidden(enc_hidden[1]))
 
-        out, dec_hidden, _attn = self.decoder(tgt, enc_hidden, context, init_output)
+        pad_mask = src[0].data.eq(onmt.Constants.PAD).t()
+
+        def apply_context_mask(m):
+            if isinstance(m, onmt.modules.GlobalAttention) or isinstance(m, onmt.modules.GlobalKeyValueAttention):
+                m.applyMask(pad_mask)
+
+        def unbind(variable):
+            new_var = variable.data.new(variable.data.size())
+            new_var.copy_(variable.data)
+            return Variable(new_var, requires_grad=False)
+
+        self.decoder.apply(apply_context_mask)
+
+        if self.attn_use_emb:
+            out, dec_hidden, _attn = self.decoder(tgt, enc_hidden, context, init_output, unbind(emb))
+        else:
+            out, dec_hidden, _attn = self.decoder(tgt, enc_hidden, context, init_output)
+
 
         return out

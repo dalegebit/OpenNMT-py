@@ -1,1 +1,2 @@
 from onmt.modules.GlobalAttention import GlobalAttention
+from onmt.modules.GlobalKeyValueAttention import GlobalKeyValueAttention

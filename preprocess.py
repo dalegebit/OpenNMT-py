@@ -74,7 +74,7 @@ def initVocabulary(name, dataFile, vocabFile, vocabSize):
         print('Reading ' + name + ' vocabulary from \'' + vocabFile + '\'...')
         vocab = onmt.Dict()
         vocab.loadFile(vocabFile)
-        print('Loaded ' + vocab.size() + ' ' + name + ' words')
+        print('Loaded ' + str(vocab.size()) + ' ' + name + ' words')
 
     if vocab is None:
         # If a dictionary is still missing, generate it.
@@ -102,21 +102,45 @@ def makeData(srcFile, tgtFile, srcDicts, tgtDicts):
     tgtF = open(tgtFile)
 
     while True:
-        srcLine = srcF.readline()
-        # print 'src:', srcLine
-        srcWords = srcLine.split()
-        tgtLine = tgtF.readline()
-        # print 'tgt:', tgtLine
-        # print
-        tgtWords = tgtLine.split()
+        # srcLine = srcF.readline()
+        # # print 'src:', srcLine
+        # srcWords = srcLine.split()
+        # tgtLine = tgtF.readline()
+        # # print 'tgt:', tgtLine
+        # # print
+        # tgtWords = tgtLine.split()
+        #
+        # if srcLine == '' or tgtLine == '':
+        #     if srcWords and not tgtWords or not srcWords and tgtWords:
+        #         print('WARNING: source and target do not have the same number of sentences')
+        #     break
+        #
+        # if len(srcWords) > 0 and len(srcWords) <= opt.seq_length \
+        #         and len(tgtWords) > 0 and len(tgtWords) <= opt.seq_length:
+        sline = srcF.readline()
+        tline = tgtF.readline()
 
-        if srcLine == '' or tgtLine == '':
-            if srcWords and not tgtWords or not srcWords and tgtWords:
-                print('WARNING: source and target do not have the same number of sentences')
+        # normal end of file
+        if sline == "" and tline == "":
             break
 
-        if len(srcWords) > 0 and len(srcWords) <= opt.seq_length \
-                and len(tgtWords) > 0 and len(tgtWords) <= opt.seq_length:
+        # source or target does not have same number of lines
+        if sline == "" or tline == "":
+            print('WARNING: source and target do not have the same number of sentences')
+            break
+
+        sline = sline.strip()
+        tline = tline.strip()
+
+        # source and/or target are empty
+        if sline == "" or tline == "":
+            print('WARNING: ignoring an empty line ('+str(count+1)+')')
+            continue
+
+        srcWords = sline.split()
+        tgtWords = tline.split()
+
+        if len(srcWords) <= opt.seq_length and len(tgtWords) <= opt.seq_length:
 
             src += [srcDicts.convertToIdx(srcWords,
                                           onmt.Constants.UNK_WORD)]
