@@ -8,7 +8,7 @@ class Optim(object):
     def set_parameters(self, params):
         self.params = list(params)  # careful: params may be a generator
         if self.method == 'sgd':
-            self.optimizer = optim.SGD(self.params, lr=self.lr)
+            self.optimizer = optim.SGD(self.params, lr=self.lr, momentum=self.momentum)
         elif self.method == 'adagrad':
             self.optimizer = optim.Adagrad(self.params, lr=self.lr)
         elif self.method == 'adadelta':
@@ -20,9 +20,10 @@ class Optim(object):
         else:
             raise RuntimeError("Invalid optim method: " + self.method)
 
-    def __init__(self, method, lr, max_grad_norm, lr_decay=1, start_decay_at=None):
+    def __init__(self, method, lr, max_grad_norm, momentum=0.9, lr_decay=1, start_decay_at=None):
         self.last_ppl = None
         self.lr = lr
+        self.momentum = momentum
         self.max_grad_norm = max_grad_norm
         self.method = method
         self.lr_decay = lr_decay

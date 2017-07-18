@@ -9,6 +9,10 @@ from torch.autograd import Variable
 import math
 import time
 
+
+
+
+    
 parser = argparse.ArgumentParser(description='train.py')
 
 ## Data options
@@ -30,9 +34,9 @@ parser.add_argument('-train_from', default='', type=str,
 
 parser.add_argument('-layers', type=int, default=2,
                     help='Number of layers in the LSTM encoder/decoder')
-parser.add_argument('-rnn_size', type=int, default=512,
+parser.add_argument('-rnn_size', type=int, default=1024,
                     help='Size of LSTM hidden states')
-parser.add_argument('-word_vec_size', type=int, default=512,
+parser.add_argument('-word_vec_size', type=int, default=1024,
                     help='Word embedding sizes')
 parser.add_argument('-input_feed', type=int, default=1,
                     help="""Feed the context vector at each time step as
@@ -86,6 +90,8 @@ parser.add_argument('-learning_rate', type=float, default=1.0,
                     help="""Starting learning rate. If adagrad/adadelta/adam is
                     used, then this is the global learning rate. Recommended
                     settings: sgd = 1, adagrad = 0.1, adadelta = 1, adam = 0.001""")
+parser.add_argument('-momentum', type=float, default=0.9,
+                    help="""Momentum, if sgd is used. Recommended settings: sgd = 0.9""")
 parser.add_argument('-learning_rate_decay', type=float, default=0.5,
                     help="""If update_learning_rate, decay learning rate by
                     this much if (i) perplexity does not decrease on the
@@ -112,6 +118,9 @@ parser.add_argument('-gpus', default=[], nargs='+', type=int,
 
 parser.add_argument('-log_interval', type=int, default=50,
                     help="Print stats at this interval.")
+
+
+
 
 opt = parser.parse_args()
 
@@ -298,6 +307,7 @@ def main():
 
     encoder = onmt.Models.Encoder(cur_opt, dicts['src'])
     decoder = onmt.Models.DecoderWithMultiAttn(cur_opt, dicts['tgt'])
+    # decoder = onmt.Models.Decoder(cur_opt, dicts['tgt'])
 
     generator = nn.Sequential(
         nn.Linear(cur_opt.rnn_size, dicts['tgt'].size()),
@@ -345,6 +355,7 @@ def main():
         decoder.load_pretrained_vectors(opt)
         optim = onmt.Optim(
             opt.optim, opt.learning_rate, opt.max_grad_norm,
+            momentum=opt.momentum,
             lr_decay=opt.learning_rate_decay,
             start_decay_at=opt.start_decay_at
         )
@@ -356,7 +367,8 @@ def main():
             optim.setLearningRate(opt.learning_rate)
         if opt.start_decay_at > parser.get_default('start_decay_at'):
             optim.setStartDecay(opt.start_decay_at)
-        if opt.optim != parser.get_default('optim'):
+        if opt.optim != optim.method:
+            print "Change optim method", optim.method, ' -> ', opt.optim
             optim.setMethod(opt.optim)
         print(optim)
 
@@ -364,7 +376,8 @@ def main():
     optim.set_parameters(model.parameters())
 
     if (opt.train_from or opt.train_from_state_dict) and \
-            opt.optim == optim.method:
+            (opt.optim == old_opt.optim):
+        # print old_opt.optim
         # print checkpoint['optim'][1]
         optim.optimizer.load_state_dict(checkpoint['optim'][1])
 
