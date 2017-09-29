@@ -123,7 +123,7 @@ class GlobalAttention(nn.Module):
             aeq(batch, batch_)
             aeq(sourceL, sourceL_)
 
-        if emb is not None:
+        if self.use_emb and emb is not None:
             batch_, sourceL_, dim_ = emb.size()
             aeq(batch, batch_)
             aeq(sourceL, sourceL_)

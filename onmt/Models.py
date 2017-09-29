@@ -8,7 +8,6 @@ from onmt.modules import aeq
 from onmt.modules.Gate import ContextGateFactory
 from torch.nn.utils.rnn import pad_packed_sequence as unpack
 from torch.nn.utils.rnn import pack_padded_sequence as pack
-import line_profiler
 
 
 class Embeddings(nn.Module):
@@ -213,10 +212,11 @@ class Encoder(nn.Module):
             outputs, hidden_t = self.rnn(packed_emb, hidden)
             if lengths:
                 outputs = unpack(outputs)[0]
-                if self.multi_gpu and largest_len and outputs.size(0) < largest_len:
+                if self.multi_gpu and largest_len \
+                   and outputs.size(0) < largest_len:
                     pads = Variable(outputs.data.new(
-                            largest_len-outputs.size(0), outputs.size(1), outputs.size(2))
-                            .zero_(), requires_grad=False)
+                            largest_len-outputs.size(0), outputs.size(1),
+                            outputs.size(2)).zero_(), requires_grad=False)
                     outputs = torch.cat([outputs, pads], 0)
             return hidden_t, outputs, emb
 
@@ -255,7 +255,8 @@ class Decoder(nn.Module):
                 stackedCell = onmt.modules.StackedGRU
             self.rnn = stackedCell(opt.layers, input_size,
                                    opt.rnn_size, opt.dropout,
-                                   opt.multi_attn, opt.attention_use_emb)
+                                   opt.multi_attn, opt.attention_use_emb,
+                                   opt.decoder_ngram)
             self.context_gate = None
             if opt.context_gate is not None:
                 self.context_gate = ContextGateFactory(
@@ -303,6 +304,7 @@ class Decoder(nn.Module):
         s_len, n_batch_, _ = src.size()
         s_len_, n_batch__, _ = context.size()
         aeq(n_batch, n_batch_, n_batch__)
+
         # aeq(s_len, s_len_)
         # END CHECKS
         if self.decoder_layer == "transformer":
@@ -310,7 +312,7 @@ class Decoder(nn.Module):
                 input = torch.cat([state.previous_input.squeeze(2), input], 0)
 
         emb = self.embeddings(input.unsqueeze(-1)
-                                if len(input.size()) == 2 else input)
+                              if len(input.size()) == 2 else input)
 
         # n.b. you can increase performance if you compute W_ih * x for all
         # iterations in parallel, but that's only possible if
@@ -366,7 +368,7 @@ class Decoder(nn.Module):
                 attn_output, attn = self.attn(rnn_output,
                                               context.transpose(0, 1),
                                               emb=src_emb.transpose(0, 1)
-                                                if src_emb is not None else None)
+                                              if src_emb is not None else None)
                 if self.context_gate is not None:
                     output = self.context_gate(
                         emb_t, rnn_output, attn_output
@@ -379,7 +381,8 @@ class Decoder(nn.Module):
 
                 # COVERAGE
                 if self._coverage:
-                    coverage = (coverage + attn) if coverage is not None else attn
+                    coverage = (coverage + attn) \
+                        if coverage is not None else attn
                     attns["coverage"] += [coverage]
 
                 # COPY
@@ -438,12 +441,14 @@ class NMTModel(nn.Module):
         """
         src = src
         tgt = tgt[:-1]  # exclude last target from inputs
-        enc_hidden, context, emb = self.encoder(src, lengths, largest_len=largest_len)
+        enc_hidden, context, emb = self.encoder(src, lengths,
+                                                largest_len=largest_len)
         enc_state = self.init_decoder_state(context, enc_hidden)
         out, dec_state, attns = self.decoder(tgt, src, context,
                                              enc_state if dec_state is None
-                                                else dec_state,
+                                             else dec_state,
                                              emb.detach())
+        self.decoder.rnn.clear_histories()
         # if self.multigpu:
         #     # Not yet supported on multi-gpu
         #     dec_state = None
@@ -551,7 +556,7 @@ class RNNDecoderState(DecoderState):
                         hs_list.append(h.split(split_size, d))
                     else:
                         hs_list.append([None] * d_size)
-                return zip(*hs_list)
+                return list(zip(*hs_list))
             elif hs is not None:
                 return hs.split(split_size, d)
             else:
@@ -564,31 +569,32 @@ class RNNDecoderState(DecoderState):
                                     for i in range(len(hiddens))]
 
     def expandAsBatch_(self, batch_size):
-        if isinstance(self.hidden, tuple):
-            new_tuple = []
-            for i in range(len(self.hidden)):
-                if self.hidden[i] is not None:
-                    n_layers, b, rnn_size = self.hidden[i].size()
-                    aeq(b, 1)
-                    new_tuple.append(self.hidden[i].expand(n_layers, batch_size, rnn_size))
-                else:
-                    new_tuple.append(None)
-            self.hidden = tuple(new_tuple)
-        else:
-            n_layers, b, rnn_size = self.hidden.size()
-            aeq(b, 1)
-            self.hidden = self.hidden.expand(n_layers, batch_size, rnn_size)
-
-        if self.input_feed is not None:
-            dim1, b, rnn_size = self.input_feed.size()
-            aeq(b, 1)
-            self.input_feed = self.input_feed.expand(dim1, batch_size, rnn_size)
-
+        aeq(self.size(1), 1)
+        vars = [e.expand(e.size(0), batch_size, e.size(2))
+                if e is not None else None
+                for e in self.all]
+        self.hidden = tuple(vars[:-1])
+        self.input_feed = vars[-1]
         if self.coverage is not None:
             b, dim1, rnn_size = self.input_feed.size()
             aeq(b, 1)
             self.coverage = self.coverage.expand(batch_size, dim1, rnn_size)
+        self.all = self.hidden + (self.input_feed,)
 
+    def repeatAsBatch_(self, batch_size, repeat_func=None):
+        if repeat_func:
+            vars = [repeat_func(e, 1, batch_size) if e is not None else None
+                    for e in self.all]
+        else:
+            vars = [e.repeat(1, batch_size, 1) if e is not None else None
+                    for e in self.all]
+
+        self.hidden = tuple(vars[:-1])
+        self.input_feed = vars[-1]
+        if self.coverage is not None:
+            self.coverage = repeat_func(self.coverage, 0, batch_size) \
+                            if repeat_func \
+                            else self.coverage.repeat(batch_size, 1, 1)
         self.all = self.hidden + (self.input_feed,)
 
     def activeUpdate_(self, positions):
@@ -638,3 +644,28 @@ class TransformerDecoderState(DecoderState):
 
     def repeatBeam_(self, beamSize):
         pass
+
+
+def build_model(opt, dicts):
+    if opt.encoder_type == "text":
+        encoder = onmt.Models.Encoder(opt, dicts['src'],
+                                      dicts.get('src_features', None))
+    elif opt.encoder_type == "img":
+        encoder = onmt.modules.ImageEncoder(opt)
+        # assert("type" not in dataset or dataset["type"] == "img")
+    else:
+        print("Unsupported encoder type %s" % (opt.encoder_type))
+
+    decoder = onmt.Models.Decoder(opt, dicts['tgt'])
+
+    if opt.copy_attn:
+        generator = onmt.modules.CopyGenerator(opt, dicts['src'], dicts['tgt'])
+    else:
+        generator = nn.Sequential(
+            nn.Linear(opt.rnn_size, dicts['tgt'].size()),
+            nn.LogSoftmax())
+        if opt.share_decoder_embeddings:
+            generator[0].weight = decoder.embeddings.word_lut.weight
+
+    model = onmt.Models.NMTModel(encoder, decoder, len(opt.gpus) > 1)
+    return model, generator

@@ -88,6 +88,8 @@ parser.add_argument('-attention_use_emb', action="store_true",
                     when averaging the query values""")
 parser.add_argument('-multi_attn', action="store_true",
                     help="""Whether use multi-hop attention in decoder""")
+parser.add_argument('-decoder_ngram', type=int, help="""Whether use n-gram histories
+                    in decoder rnn""")
 
 # Optimization options
 parser.add_argument('-encoder_type', default='text',
@@ -175,6 +177,8 @@ parser.add_argument('-gpus', default=[], nargs='+', type=int,
 
 parser.add_argument('-log_interval', type=int, default=50,
                     help="Print stats at this interval.")
+parser.add_argument('-log_file', type=str,
+                    help="Print log information into log file.")
 parser.add_argument('-log_server', type=str, default="",
                     help="Send logs to this crayon server.")
 parser.add_argument('-experiment_name', type=str, default="",
@@ -186,7 +190,6 @@ parser.add_argument('-seed', type=int, default=-1,
 
 opt = parser.parse_args()
 
-print(opt)
 
 if opt.seed > 0:
     torch.manual_seed(opt.seed)
@@ -236,6 +239,12 @@ def trainModel(model, trainData, validData, dataset, optim, mrtTrainer=None):
         os.mkdir(model_dirname)
     assert os.path.isdir(model_dirname), "%s not a directory" % opt.save_model
 
+    if opt.log_file:
+        log_dirname = os.path.dirname(opt.log_file)
+        if not os.path.exists(log_dirname):
+            os.mkdir(log_dirname)
+        assert os.path.isdir(log_dirname), "%s not a directory" % opt.log_file
+
     # Define criterion of each GPU.
     if not opt.copy_attn:
         criterion = onmt.Loss.NMTCriterion(dataset['dicts']['tgt'].size(), opt)
@@ -267,18 +276,19 @@ def trainModel(model, trainData, validData, dataset, optim, mrtTrainer=None):
             trunc_size = opt.truncated_decoder if opt.truncated_decoder \
                 else target_size
 
-            if i and i % 500 == 0:
+            if True and i % 5 == 0:
                 # model.zero_grad()
-                break
-                rl_stats = mrtTrainer.policy_grad(batch)
-                mrtTrainer.step.temperature = max(0.5, math.exp(
-                                            -3e-5*(epoch * len(trainData) + i)))
+                # mrtTrainer.train_batch(batch)
+                report_rl_stats = onmt.Loss.RLStatistics()
+                rl_stats = mrtTrainer.eval_batch(batch)
+                # mrtTrainer.step.temperature = max(0.5, math.exp(
+                #                             -3e-5*(epoch * len(trainData) + i)))
                 total_rl_stats.update(rl_stats)
                 report_rl_stats.update(rl_stats)
                 report_rl_stats.output(epoch, i+1, len(trainData),
                                        total_rl_stats.start_time)
-                report_rl_stats = onmt.Loss.RLStatistics()
-
+            if len(opt.gpus):
+                batch.cuda(opt.gpus[0])
             for j in range(0, target_size-1, trunc_size):
                 trunc_batch = batch.truncate(j, j + trunc_size)
 
@@ -294,9 +304,9 @@ def trainModel(model, trainData, validData, dataset, optim, mrtTrainer=None):
                     = mem_loss.loss(trunc_batch, outputs, attn)
 
                 torch.autograd.backward(inputs, grads)
-                for n, p in model.named_parameters():
-                    print '%-40s: %10.10f' % (n, p.grad.data.sum())
-                import pdb; pdb.set_trace()
+                # for n, p in model.named_parameters():
+                #     print '%-40s: %10.10f' % (n, p.grad.data.sum())
+                # import pdb; pdb.set_trace()
 
                 # Update the parameters.
                 optim.step()
@@ -309,7 +319,8 @@ def trainModel(model, trainData, validData, dataset, optim, mrtTrainer=None):
 
             if i % opt.log_interval == -1 % opt.log_interval:
                 report_stats.output(epoch, i+1, len(trainData),
-                                    total_stats.start_time)
+                                    total_stats.start_time,
+                                    log_file=opt.log_file)
 
                 if opt.log_server:
                     report_stats.log("progress", experiment, optim)
@@ -404,27 +415,7 @@ def main():
 
     print('Building model...')
 
-    if opt.encoder_type == "text":
-        encoder = onmt.Models.Encoder(opt, dicts['src'],
-                                      dicts.get('src_features', None))
-    elif opt.encoder_type == "img":
-        encoder = onmt.modules.ImageEncoder(opt)
-        assert("type" not in dataset or dataset["type"] == "img")
-    else:
-        print("Unsupported encoder type %s" % (opt.encoder_type))
-
-    decoder = onmt.Models.Decoder(opt, dicts['tgt'])
-
-    if opt.copy_attn:
-        generator = onmt.modules.CopyGenerator(opt, dicts['src'], dicts['tgt'])
-    else:
-        generator = nn.Sequential(
-            nn.Linear(opt.rnn_size, dicts['tgt'].size()),
-            nn.LogSoftmax())
-        if opt.share_decoder_embeddings:
-            generator[0].weight = decoder.embeddings.word_lut.weight
-
-    model = onmt.Models.NMTModel(encoder, decoder, len(opt.gpus) > 1)
+    model, generator = onmt.Models.build_model(opt, dicts)
 
     if opt.train_from:
         print('Loading model from checkpoint at %s' % opt.train_from)
@@ -443,38 +434,33 @@ def main():
         generator.load_state_dict(checkpoint['generator'])
         opt.start_epoch = checkpoint['epoch'] + 1
 
-    # XXX for rl test
-    mrtTrainer = onmt.MRT(model, generator, onmt.Loss.BleuScore(), opt)
-
     if len(opt.gpus) >= 1:
         model.cuda()
         generator.cuda()
-        mrtTrainer.step.cuda()
     else:
         model.cpu()
         generator.cpu()
-        mrtTrainer.step.cpu()
 
-    if len(opt.gpus) > 1:
-        print('Multi gpu training ', opt.gpus)
-        model = nn.DataParallel(model, device_ids=opt.gpus, dim=1)
-        mrtTrainer.step = nn.DataParallel(mrtTrainer.step, device_ids=opt.gpus, dim=1)
-        generator = nn.DataParallel(generator, device_ids=opt.gpus, dim=0)
+    # if len(opt.gpus) > 1:
+    #     print('Multi gpu training ', opt.gpus)
+    #     model = nn.DataParallel(model, device_ids=opt.gpus, dim=1)
+    #     generator = nn.DataParallel(generator, device_ids=opt.gpus, dim=0)
 
     model.generator = generator
 
+    optim_changed = False
     if not opt.train_from_state_dict and not opt.train_from:
         if opt.param_init != 0.0:
             print('Intializing params')
             for p in model.parameters():
-                # p.data.uniform_(-opt.param_init, opt.param_init)
-                if len(p.size()) == 1:
-                    p.data.fill_(1.0)
-                else:
-                    p.data.uniform_(-opt.param_init, opt.param_init)
+                p.data.uniform_(-opt.param_init, opt.param_init)
+                # if len(p.size()) == 1:
+                #     p.data.fill_(1.0)
+                # else:
+                #     p.data.uniform_(-opt.param_init, opt.param_init)
 
-        encoder.embeddings.load_pretrained_vectors(opt.pre_word_vecs_enc)
-        decoder.embeddings.load_pretrained_vectors(opt.pre_word_vecs_dec)
+        model.encoder.embeddings.load_pretrained_vectors(opt.pre_word_vecs_enc)
+        model.decoder.embeddings.load_pretrained_vectors(opt.pre_word_vecs_dec)
 
         optim = onmt.Optim(
             opt.optim, opt.learning_rate, opt.max_grad_norm,
@@ -496,13 +482,16 @@ def main():
         if opt.optim != optim.method:
             print("Change optim method %s -> %s" % (optim.method, opt.optim))
             optim.method = opt.optim
+            optim_changed = True
         print(optim)
 
     optim.set_parameters(model.parameters())
 
-    if opt.train_from or opt.train_from_state_dict:
-        optim.optimizer.load_state_dict(
-            checkpoint['optim'][1])
+    # XXX for rl test
+    mrtTrainer = onmt.MRT(model, optim, dicts, opt)
+
+    if opt.train_from or opt.train_from_state_dict and not optim_changed:
+        optim.optimizer.load_state_dict(checkpoint['optim'][1])
 
     nParams = sum([p.nelement() for p in model.parameters()])
     print('* number of parameters: %d' % nParams)
@@ -522,4 +511,5 @@ def main():
 
 
 if __name__ == "__main__":
+    print(opt)
     main()

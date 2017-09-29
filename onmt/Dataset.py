@@ -127,8 +127,8 @@ class Dataset(object):
                           :region[i].size(0)] = region[i].t()
             alignment = alignment.float()
 
-            if self.cuda:
-                alignment = alignment.cuda()
+            # if self.cuda:
+            #     alignment = alignment.cuda()
         # tgt_len x batch x src_len
         lengths = torch.LongTensor(lengths)
         indices = range(len(srcBatch))
@@ -150,8 +150,8 @@ class Dataset(object):
             b = torch.stack(b, 0)
             if dtype == "text":
                 b = b.transpose(0, 1).contiguous()
-            if self.cuda:
-                b = b.cuda()
+            # if self.cuda:
+            #     b = b.cuda()
             b = Variable(b, volatile=self.volatile)
             return b
 
@@ -201,7 +201,8 @@ class Batch(object):
         """
         return Batch(self.src, self.tgt[start:end],
                      self.lengths, self.indices, self.batchSize,
-                     self.alignment[start:end] if self.alignment is not None else None)
+                     self.alignment[start:end]
+                     if self.alignment is not None else None)
 
     def xsplit(self, mini_size):
         n = 0
@@ -212,5 +213,13 @@ class Batch(object):
             yield Batch(self.src[:src_max_len, n:m], self.tgt[:, n:m],
                         lengths, self.indices[n:m], mini_size,
                         self.alignment[:, n:m, :src_max_len]
-                            if self.alignment is not None else None)
+                        if self.alignment is not None else None)
             n += mini_size
+
+    def cuda(self, device_id=0):
+        self.src = self.src.cuda(device_id)
+        self.tgt = self.tgt.cuda(device_id)
+        self.lengths = self.lengths.cuda(device_id)
+        if self.alignment is not None:
+            self.alignment = self.alignment.cuda(device_id)
+        return self

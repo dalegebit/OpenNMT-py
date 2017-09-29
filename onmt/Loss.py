@@ -129,18 +129,23 @@ class Statistics(BasicStatistics):
     def ppl(self):
         return math.exp(min(self.loss / self.n_words, 100))
 
-    def output(self, epoch, batch, n_batches, start):
+    def output(self, epoch, batch, n_batches, start, bleu=False,
+               log_file=None):
         t = self.elapsed_time()
-        print(("Epoch %2d, %5d/%5d; acc: %5.2f; ppl: %5.2f; bleu: %4.2f; " +
-               "%3.0f src tok/s; %3.0f tgt tok/s; %5.0f s elapsed") %
-              (epoch, batch,  n_batches,
-               self.accuracy(),
-               self.ppl(),
-               self.bleu(),
-               self.n_src_words / (t + 1e-5),
-               self.n_words / (t + 1e-5),
-               time.time() - start))
+        log_info = ("Epoch %2d, %5d/%5d; acc: %5.2f; ppl: %5.2f; " +
+                    (("bleu: %4.2f; " % self.bleu()) if bleu else "") +
+                    "%3.0f src tok/s; %3.0f tgt tok/s; %5.0f s elapsed") % \
+                   (epoch, batch,  n_batches,
+                    self.accuracy(),
+                    self.ppl(),
+                    self.n_src_words / (t + 1e-5),
+                    self.n_words / (t + 1e-5),
+                    time.time() - start)
+        print(log_info)
         sys.stdout.flush()
+        if log_file:
+            with open(log_file, 'a') as f:
+                print >> f, log_info
 
     def log(self, prefix, experiment, optim):
         self.log_basic(prefix, experiment, optim)
