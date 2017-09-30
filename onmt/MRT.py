@@ -27,6 +27,7 @@ def train_agent(rank, opt, dicts, queue, out_queue, model, locks):
     while True:
         batch = queue.get()
         batch.cuda(rank)
+        local_model.zero_grad()
         for b in batch.xsplit(6):  # mini_size = 6
             samples, _, probs, scores = \
                 sampler.sample(20, b.src, b.tgt, b.lengths,
@@ -39,16 +40,15 @@ def train_agent(rank, opt, dicts, queue, out_queue, model, locks):
         out_queue.put(rank)
 
 
-class MRT(object):
-    def __init__(self, model, optimizer, dicts, opt):
+class RLBatchTrainer(object):
+    def __init__(self, model, dicts, opt):
+        mp.set_start_method('spawn')
         self.model = model
         self.generator = model.generator
         self.model.share_memory()
-        self.optimizer = optimizer
         self.opt = opt
         self.dicts = dicts  # for initializing embeddings
         self.gpus = opt.gpus
-        mp.set_start_method('spawn')
         self.queue = mp.SimpleQueue()
         self.recv_queue = mp.SimpleQueue()
         self.locks = {'encoder': mp.Lock(), 'decoder': mp.Lock(),
@@ -63,15 +63,12 @@ class MRT(object):
             p.start()
             self.agents.append(p)
 
-    def train_batch(self, batch):
-
+    def get_batch_grad(self, batch):
         split_size = int(math.ceil(batch.batchSize / len(self.gpus)))
-        self.model.zero_grad()
         for minibatch in batch.xsplit(split_size):
             self.queue.put(minibatch)
         for _ in self.gpus:
             self.recv_queue.get()
-        self.optimizer.step()
 
     def eval_batch(self, batch):
         rl_statistics = RLStatistics()

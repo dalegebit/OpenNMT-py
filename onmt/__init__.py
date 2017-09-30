@@ -7,9 +7,9 @@ from onmt.Optim import Optim
 from onmt.Dict import Dict
 from onmt.Beam import Beam
 from onmt.Sampler import Sampler
-from onmt.MRT import MRT
+from onmt.Trainer import Trainer, RLBatchTrainer
 
 # For flake8 compatibility.
 __all__ = [onmt.Constants, onmt.Models, onmt.Loss,
            Translator, Dataset, Optim, Dict, Beam,
-           Sampler, MRT]
+           Sampler, Trainer, RLBatchTrainer]

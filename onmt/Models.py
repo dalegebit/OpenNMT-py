@@ -492,7 +492,8 @@ class DecoderState(object):
             if h is not None:
                 dim_size = h.size(dim)
             elif dim_size != h.size(dim):
-                print("DecoderState WARNING, dimension not matched for all items!")
+                print("""DecoderState WARNING,
+                      dimension not matched for all items!""")
                 return None
         if dim_size is None:
             print("DecoderState WARNING, all states are None!")

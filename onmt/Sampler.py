@@ -38,6 +38,10 @@ def gumbel_softmax(logits, temperature, hard=False):
 
 
 class Sampler(object):
+    """
+    Very efficient sampler, can sample multiple samples for multiple
+    (as many as the gpu memory allows) inputs once
+    """
 
     def __init__(self, model, opt, scorer=None):
         super(Sampler, self).__init__()
@@ -56,19 +60,20 @@ class Sampler(object):
         self.temperature = 1.0
         self.gumbel = False
 
-    def sample(self, n_sample, srcs, tgts, lengths, enc_states=None,
-               contexts=None, embs=None, largest_len=None, is_eval=False):
+    def sample(self, n_sample, srcs, tgts, lengths, start_pos=1,
+               enc_states=None, contexts=None, embs=None,
+               largest_len=None, is_eval=False):
 
         ###################################################################
-        # 1. Encode is enc_states not given
+        # 1. Encode enc_states if not given
         if enc_states is None or contexts is None:
             enc_states, contexts, embs = self.model.encoder(
                 srcs, lengths=lengths, largest_len=largest_len
             )
-            seqL, batch_size, rnn_size = contexts.size()
-
             enc_states = self.model.init_decoder_state(contexts, enc_states)
-
+            start_pos = 1
+            
+        seqL, batch_size, rnn_size = contexts.size()
         pad_masks = srcs[:, :, 0].data.eq(onmt.Constants.PAD).t()
 
         def mask(pad):
@@ -130,7 +135,7 @@ class Sampler(object):
             mask(pad.unsqueeze(0))
 
             # b. Begin Sampling
-            for i in range(1, max_len):
+            for i in range(start_pos, max_len):
                 dec_out, dec_states, attn = self.model.decoder(input,
                                                                src,
                                                                context,
@@ -201,7 +206,6 @@ class Sampler(object):
                 bleu = self.scorer.score(result_seqs, tgt_t)
                 bleu = Variable(accum_scores.data.new(bleu), volatile=is_eval)
                 all_bleus.append(bleu)
-            # import pdb; pdb.set_trace()
             all_seqs.extend(result_seqs)
             all_log_probs.append(accum_scores)
             all_probs.append(prob)

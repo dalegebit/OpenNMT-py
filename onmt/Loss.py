@@ -84,9 +84,8 @@ class BasicStatistics(object):
     """
     Template of Statistics
     """
-    def __init__(self, n_words=0, n_correct=0, n_sents=0):
+    def __init__(self, n_words=0, n_sents=0):
         self.n_words = n_words
-        self.n_correct = n_correct
         self.n_sents = n_sents
         self.n_src_words = 0
         self.start_time = time.time()
@@ -98,12 +97,8 @@ class BasicStatistics(object):
 
     def log_basic(self, prefix, experiment, optim):
         t = self.elapsed_time()
-        experiment.add_scalar_value(prefix + "_accuracy", self.accuracy())
         experiment.add_scalar_value(prefix + "_tgtper",  self.n_words / t)
         experiment.add_scalar_value(prefix + "_lr", optim.lr)
-
-    def accuracy(self):
-        return 100 * (self.n_correct / float(self.n_words))
 
     def elapsed_time(self):
         return time.time() - self.start_time
@@ -113,15 +108,20 @@ class Statistics(BasicStatistics):
     """
     Training loss function statistics.
     """
-    def __init__(self, loss=0, bleu=0, *args, **kargs):
+    def __init__(self, loss=0, n_correct=0, bleu=0, *args, **kargs):
         super(Statistics, self).__init__(*args, **kargs)
         self.loss = loss
+        self.n_correct = n_correct
         self.total_bleu = bleu
 
     def update(self, stat):
         self.update_basic(stat)
         self.loss += stat.loss
+        self.n_correct += stat.n_correct
         self.total_bleu += stat.total_bleu
+
+    def accuracy(self):
+        return 100 * (self.n_correct / float(self.n_words))
 
     def bleu(self):
         return 100 * (self.total_bleu / float(self.n_sents))
@@ -149,6 +149,7 @@ class Statistics(BasicStatistics):
 
     def log(self, prefix, experiment, optim):
         self.log_basic(prefix, experiment, optim)
+        experiment.add_scalar_value(prefix + "_accuracy", self.accuracy())
         experiment.add_scalar_value(prefix + "_ppl", self.ppl())
         experiment.add_scalar_value(prefix + "_bleu", self.bleu())
 
@@ -176,10 +177,9 @@ class RLStatistics(BasicStatistics):
 
     def output(self, epoch, batch, n_batches, start):
         t = self.elapsed_time()
-        print(("Epoch %2d, %5d/%5d; acc: %5.2f; bleu: %4.2f; std: %4.2f; " +
+        print(("Epoch %2d, %5d/%5d; bleu: %4.2f; std: %4.2f; " +
                "%3.0f src tok/s; %3.0f tgt tok/s; %5.0f s elapsed") %
               (epoch, batch,  n_batches,
-               self.accuracy(),
                self.bleu_mean(),
                self.bleu_std(),
                self.n_src_words / (t + 1e-5),
@@ -288,7 +288,6 @@ class BleuScore:
             ref_dict, targ_len = self.getRefDict(targ_seq, ngram)
             bleu = self.calBleu(pred_seq, ref_dict, targ_len, ngram)
             bleus.append(bleu)
-
         return bleus
 
 
@@ -300,7 +299,7 @@ class MemoryEfficientLoss:
                  copy_loss=False,
                  coverage_loss=False,
                  eval=False,
-                 rl=False):
+                 calc_bleu=False):
         """
         Args:
             generator (Function): ( any x rnn_size ) -> ( any x tgt_vocab )
@@ -315,7 +314,7 @@ class MemoryEfficientLoss:
         self.lambda_coverage = opt.lambda_coverage
         self.coverage_loss = coverage_loss
         self.cuda = len(opt.gpus) > 0
-        self.rl = rl
+        self.calc_bleu = calc_bleu
         self.bleu_scorer = BleuScore()
 
     def score(self, loss_t, scores_t, targ_t, bleu=0):
@@ -324,8 +323,8 @@ class MemoryEfficientLoss:
         num_correct_t = pred_t.eq(targ_t.data) \
                               .masked_select(non_padding) \
                               .sum()
-        return Statistics(loss_t.data[0], bleu, non_padding.sum(),
-                          num_correct_t, n_sents=targ_t.size(0))
+        return Statistics(loss_t.data[0], num_correct_t, bleu,
+                          non_padding.sum(), n_sents=targ_t.size(0))
 
     def compute_std_loss(self, out_t, targ_t):
         scores_t = self.generator(out_t)
@@ -377,12 +376,17 @@ class MemoryEfficientLoss:
                 loss_t += self.lambda_coverage * torch.min(s["coverage"],
                                                            s["attn"]).sum()
 
-            b, l, _ = s["out_t"].size()
-            scores_rec = scores_t.view(b, l, -1)
-            bleu = self.bleu_scorer.score(scores_rec.max(-1)[1].squeeze(-1), s["targ_t"])
+            if self.calc_bleu:
+                b, l, _ = s["out_t"].size()
+                scores_rec = scores_t.view(b, l, -1)
+                bleu = self.bleu_scorer.score(
+                    scores_rec.max(-1)[1].squeeze(-1),
+                    s["targ_t"])
+                stats.update(self.score(loss_t, scores_t,
+                                        s["targ_t"], sum(bleu)))
 
-            stats.update(self.score(loss_t, scores_t, s["targ_t"], sum(bleu)))
-            # stats.update(self.score(loss_t, scores_t, s["targ_t"], 0))
+            else:
+                stats.update(self.score(loss_t, scores_t, s["targ_t"]))
             if not self.eval:
                 loss_t.div(batch.batchSize).backward()
 

@@ -91,6 +91,19 @@ parser.add_argument('-multi_attn', action="store_true",
 parser.add_argument('-decoder_ngram', type=int, help="""Whether use n-gram histories
                     in decoder rnn""")
 
+# Reinforce Learning options
+parser.add_argument('-rl_training', action='store_true',
+                    help="""Whether start reinforcement training""")
+parser.add_argument('-rl_sample_num', type=int, default=20,
+                    help="""The number of generated samples for each
+                    source sequence""")
+parser.add_argument('-max_samples_per_optim', type=int, default=160,
+                    help="""The maximum number of generated samples that
+                    are going to calculate gradient at a time, controlling
+                    the memory usage""")
+parser.add_argument('-roll_out', action='store_true',
+                    help="Refs: SeqGAN")
+
 # Optimization options
 parser.add_argument('-encoder_type', default='text',
                     help="Type of encoder to use. Options are [text|img].")
@@ -127,7 +140,7 @@ parser.add_argument('-adam_beta2', type=float, default=0.98,
                     help='Adam beta2')
 
 
-parser.add_argument('-curriculum', action="store_true",
+parser.add_argument('-curriculum_epoches', type=int, default=0,
                     help="""For this many epochs, order the minibatches based
                     on source sequence length. Sometimes setting this to 1 will
                     increase convergence speed.""")
@@ -201,18 +214,6 @@ if opt.gpus:
     cuda.set_device(opt.gpus[0])
     if opt.seed > 0:
         torch.cuda.manual_seed(opt.seed)
-
-
-# Set up the Crayon logging server.
-if opt.log_server != "":
-    from pycrayon import CrayonClient
-    cc = CrayonClient(hostname=opt.log_server)
-
-    experiments = cc.get_experiment_names()
-    print(experiments)
-    if opt.experiment_name in experiments:
-        cc.remove_experiment(opt.experiment_name)
-    experiment = cc.create_experiment(opt.experiment_name)
 
 
 def eval(model, criterion, data):
@@ -487,11 +488,30 @@ def main():
 
     optim.set_parameters(model.parameters())
 
-    # XXX for rl test
-    mrtTrainer = onmt.MRT(model, optim, dicts, opt)
-
     if opt.train_from or opt.train_from_state_dict and not optim_changed:
         optim.optimizer.load_state_dict(checkpoint['optim'][1])
+
+    model_dirname = os.path.dirname(opt.save_model)
+    if not os.path.exists(model_dirname):
+        os.mkdir(model_dirname)
+    assert os.path.isdir(model_dirname), "%s not a directory" % opt.save_model
+
+    # Set up the Crayon logging server.
+    if opt.log_server != "":
+        from pycrayon import CrayonClient
+        cc = CrayonClient(hostname=opt.log_server)
+
+        experiments = cc.get_experiment_names()
+        print(experiments)
+        if opt.experiment_name in experiments:
+            cc.remove_experiment(opt.experiment_name)
+        experiment = cc.create_experiment(opt.experiment_name)
+
+    if opt.log_file:
+        log_dirname = os.path.dirname(opt.log_file)
+        if not os.path.exists(log_dirname):
+            os.mkdir(log_dirname)
+        assert os.path.isdir(log_dirname), "%s not a directory" % opt.log_file
 
     nParams = sum([p.nelement() for p in model.parameters()])
     print('* number of parameters: %d' % nParams)
@@ -507,7 +527,10 @@ def main():
     print('encoder: ', enc)
     print('decoder: ', dec)
 
-    trainModel(model, trainData, validData, dataset, optim, mrtTrainer)
+    trainer = onmt.Trainer(model, trainData, validData, dataset,
+                           optim, opt, experiment)
+
+    trainModel(trainer)
 
 
 if __name__ == "__main__":
