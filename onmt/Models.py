@@ -168,7 +168,7 @@ class Encoder(nn.Module):
                  dropout=opt.dropout,
                  bidirectional=opt.brnn)
 
-    def forward(self, input, lengths=None, hidden=None, largest_len=None):
+    def forward(self, input, lengths=None, hidden=None, align=None):
         """
         Args:
             input (LongTensor): len x batch x nfeat
@@ -212,10 +212,10 @@ class Encoder(nn.Module):
             outputs, hidden_t = self.rnn(packed_emb, hidden)
             if lengths:
                 outputs = unpack(outputs)[0]
-                if self.multi_gpu and largest_len \
-                   and outputs.size(0) < largest_len:
+                if self.multi_gpu and align \
+                   and outputs.size(0) < align:
                     pads = Variable(outputs.data.new(
-                            largest_len-outputs.size(0), outputs.size(1),
+                            align-outputs.size(0), outputs.size(1),
                             outputs.size(2)).zero_(), requires_grad=False)
                     outputs = torch.cat([outputs, pads], 0)
             return hidden_t, outputs, emb
@@ -427,7 +427,7 @@ class NMTModel(nn.Module):
         dec.init_input_feed(context, self.decoder.hidden_size)
         return dec
 
-    def forward(self, src, tgt, lengths, dec_state=None, largest_len=None):
+    def forward(self, src, tgt, lengths, dec_state=None, align=None):
         """
         Args:
             src, tgt, lengths
@@ -442,7 +442,7 @@ class NMTModel(nn.Module):
         src = src
         tgt = tgt[:-1]  # exclude last target from inputs
         enc_hidden, context, emb = self.encoder(src, lengths,
-                                                largest_len=largest_len)
+                                                align=align)
         enc_state = self.init_decoder_state(context, enc_hidden)
         out, dec_state, attns = self.decoder(tgt, src, context,
                                              enc_state if dec_state is None
@@ -567,7 +567,29 @@ class RNNDecoderState(DecoderState):
         input_feeds = _split(self.input_feed, dim, dim_size)
         coverages = _split(self.coverage, coverage_dim, dim_size)
         return [RNNDecoderState(hiddens[i], input_feeds[i], coverages[i])
-                                    for i in range(len(hiddens))]
+                for i in range(len(hiddens))]
+
+    @staticmethod
+    def cat(states):
+        vars = [torch.cat(list(e), 1)
+                if e is not None else None
+                for e in zip(*[state.all for state in states])]
+        hidden = tuple(vars[:-1])
+        input_feed = vars[-1]
+        coverages = [state.coverage for state in states]
+        coverage = torch.cat(coverages, 0) if not (None in coverages) else None
+        return RNNDecoderState(hidden, input_feed, coverage)
+
+    def getDummy(self, requires_grad=True):
+        vars = [Variable(e.data, requires_grad=requires_grad)
+                if e is not None else None
+                for e in self.all]
+        hidden = tuple(vars[:-1])
+        input_feed = vars[-1]
+        coverage = None
+        if self.coverage is not None:
+            coverage = Variable(self.coverage.data, requires_grad=requires_grad)
+        return RNNDecoderState(hidden, input_feed, coverage)
 
     def expandAsBatch_(self, batch_size):
         aeq(self.size(1), 1)

@@ -1,4 +1,5 @@
 import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
 from torch.nn.utils import clip_grad_norm
 
 
@@ -8,32 +9,37 @@ class Optim(object):
         self.params = list(params)  # careful: params may be a generator
         if self.method == 'sgd':
             self.optimizer = optim.SGD(self.params, lr=self.lr,
-                                       momentum=self.momentum)
+                                       momentum=self.momentum,
+                                       weight_decay=self.weight_decay)
         elif self.method == 'adagrad':
-            self.optimizer = optim.Adagrad(self.params, lr=self.lr)
+            self.optimizer = optim.Adagrad(self.params, lr=self.lr,
+                                           weight_decay=self.weight_decay)
         elif self.method == 'adadelta':
-            self.optimizer = optim.Adadelta(self.params, lr=self.lr)
+            self.optimizer = optim.Adadelta(self.params, lr=self.lr,
+                                            weight_decay=self.weight_decay)
         elif self.method == 'adam':
             self.optimizer = optim.Adam(self.params, lr=self.lr,
-                                        betas=self.betas, eps=1e-9)
+                                        betas=self.betas, eps=1e-9,
+                                        weight_decay=self.weight_decay)
         else:
             raise RuntimeError("Invalid optim method: " + self.method)
+        self.scheduler = lr_scheduler.ReduceLROnPlateau(self.optimizer,
+                                                        factor=self.lr_decay)
 
     def __init__(self, method, lr, max_grad_norm,
                  lr_decay=1, start_decay_at=None,
                  beta1=0.9, beta2=0.98, momentum=0.9,
-                 opt=None):
-        self.last_ppl = None
+                 use_noam=False):
         self.lr = lr
         self.max_grad_norm = max_grad_norm
         self.method = method
         self.lr_decay = lr_decay
         self.start_decay_at = start_decay_at
-        self.start_decay = False
         self._step = 0
         self.betas = (beta1, beta2)
         self.momentum = momentum
-        self.opt = opt
+        self.use_noam = use_noam
+        self.weight_decay = 0.0001
 
     def _setRate(self, lr):
         self.lr = lr
@@ -44,7 +50,7 @@ class Optim(object):
         self._step += 1
 
         # Decay method used in tensor2tensor.
-        if self.opt.__dict__.get("decay_method", "") == "noam":
+        if self.use_noam:
             self._setRate(
                 self.opt.learning_rate *
                 (self.opt.rnn_size ** (-0.5) *
@@ -60,15 +66,11 @@ class Optim(object):
         Decay learning rate if val perf does not improve
         or we hit the start_decay_at limit.
         """
-
         if self.start_decay_at is not None and epoch >= self.start_decay_at:
-            self.start_decay = True
-        if self.last_ppl is not None and ppl > self.last_ppl:
-            self.start_decay = True
+            old_lr = self.optimizer.param_groups[0]['lr']
+            self.scheduler.step(ppl)
+            if old_lr != self.optimizer.param_groups[0]['lr']:
+                print("Decaying learning rate to %g"
+                      % self.optimizer.param_groups[0]['lr'])
 
-        if self.start_decay:
-            self.lr = self.lr * self.lr_decay
-            print("Decaying learning rate to %g" % self.lr)
-
-        self.last_ppl = ppl
-        self.optimizer.param_groups[0]['lr'] = self.lr
+        self.lr = self.optimizer.param_groups[0]['lr']

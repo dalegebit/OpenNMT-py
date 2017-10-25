@@ -10,8 +10,8 @@ import argparse
 import torch
 import torch.nn as nn
 from torch import cuda
+
 import math
-import line_profiler
 
 parser = argparse.ArgumentParser(description='train.py')
 onmt.Markdown.add_md_help_argument(parser)
@@ -94,14 +94,14 @@ parser.add_argument('-decoder_ngram', type=int, help="""Whether use n-gram histo
 # Reinforce Learning options
 parser.add_argument('-rl_training', action='store_true',
                     help="""Whether start reinforcement training""")
-parser.add_argument('-rl_sample_num', type=int, default=20,
+parser.add_argument('-rl_sample_num', type=int, default=5,
                     help="""The number of generated samples for each
                     source sequence""")
-parser.add_argument('-max_samples_per_optim', type=int, default=160,
+parser.add_argument('-max_samples_per_optim', type=int, default=100,
                     help="""The maximum number of generated samples that
                     are going to calculate gradient at a time, controlling
                     the memory usage""")
-parser.add_argument('-roll_out', action='store_true',
+parser.add_argument('-rollout', type=int, default=20,
                     help="Refs: SeqGAN")
 
 # Optimization options
@@ -118,9 +118,15 @@ parser.add_argument('-epochs', type=int, default=13,
 parser.add_argument('-start_epoch', type=int, default=1,
                     help='The epoch from which to start')
 parser.add_argument('-param_init', type=float, default=0.1,
-                    help="""Parameters are initialized over uniform distribution
-                    with support (-param_init, param_init).
+                    help="""The hyper-parameters of the distribution that is used to
+                    initialize the model parameters. (lower=-param_init,
+                    upper=param_init) for uniform distribution, (mean=0,
+                    std=param_init) for normal distribution.
                     Use 0 to not use initialization""")
+parser.add_argument('-init_method', type=str, default='uniform',
+                    choices=['uniform', 'normal', 'xavier', 'ortho'],
+                    help="""The parameter initialization method to use.
+                    Options: [uniform|normal|xavier|ortho]""")
 parser.add_argument('-optim', default='sgd',
                     help="Optimization method. [sgd|adagrad|adadelta|adam]")
 parser.add_argument('-max_grad_norm', type=float, default=5,
@@ -171,6 +177,9 @@ parser.add_argument('-decay_method', type=str, default="",
                     help="""Use a custom learning rate decay [|noam] """)
 parser.add_argument('-warmup_steps', type=int, default=4000,
                     help="""Number of warmup steps for custom decay.""")
+parser.add_argument('-lr_schedule_interval', type=int, default=200,
+                    help="""Compute validation statitisc and schedule
+                    learning rate at this interval""")
 
 
 # pretrained word vectors
@@ -216,164 +225,52 @@ if opt.gpus:
         torch.cuda.manual_seed(opt.seed)
 
 
-def eval(model, criterion, data):
-    stats = onmt.Loss.Statistics()
-    model.eval()
-    loss = onmt.Loss.MemoryEfficientLoss(opt, model.generator, criterion,
-                                         eval=True, copy_loss=opt.copy_attn)
-    for i in range(len(data)):
-        batch = data[i]
-        outputs, attn, dec_hidden = model(batch.src, batch.tgt, batch.lengths,
-                                          largest_len=batch.lengths.data.max())
-        batch_stats, _, _ = loss.loss(batch, outputs, attn)
-        stats.update(batch_stats)
-    model.train()
-    return stats
+def initParam(param, method, factor):
+    if method == 'uniform':
+        param.data.uniform_(-factor, factor)
+    elif method == 'normal':
+        param.data.normal_(0, factor)
+    elif method == 'xavier':
+        var = 2 / (param.size(0)+param.size(0)) if param.dim() == 2 \
+              else 1 / param.size(0)
+        param.data.normal_(0, math.sqrt(var))
+    elif method == 'ortho':
+        param.data.normal_(0, factor)
+        if param.dim() == 2:
+            stride = math.gcd(param.size(0), param.size(1))
+            for i in range(param.size(0)//stride):
+                for j in range(param.size(1)//stride):
+                    u, _, _ = torch.svd(param.data[i*stride:(i+1)*stride,
+                                                   j*stride:(j+1)*stride])
+                    param.data[i*stride:(i+1)*stride,
+                               j*stride:(j+1)*stride] = u
 
 
-def trainModel(model, trainData, validData, dataset, optim, mrtTrainer=None):
-    print(model)
-    model.train()
-
-    model_dirname = os.path.dirname(opt.save_model)
-    if not os.path.exists(model_dirname):
-        os.mkdir(model_dirname)
-    assert os.path.isdir(model_dirname), "%s not a directory" % opt.save_model
-
-    if opt.log_file:
-        log_dirname = os.path.dirname(opt.log_file)
-        if not os.path.exists(log_dirname):
-            os.mkdir(log_dirname)
-        assert os.path.isdir(log_dirname), "%s not a directory" % opt.log_file
-
-    # Define criterion of each GPU.
-    if not opt.copy_attn:
-        criterion = onmt.Loss.NMTCriterion(dataset['dicts']['tgt'].size(), opt)
-    else:
-        criterion = onmt.modules.CopyCriterion
-
-    def trainEpoch(epoch):
-        if opt.extra_shuffle and epoch > opt.curriculum:
-            trainData.shuffle()
-
-        mem_loss = onmt.Loss.MemoryEfficientLoss(opt, model.generator,
-                                                 criterion,
-                                                 copy_loss=opt.copy_attn)
-
-        # Shuffle mini batch order.
-        batchOrder = torch.randperm(len(trainData))
-
-        total_stats = onmt.Loss.Statistics()
-        report_stats = onmt.Loss.Statistics()
-        total_rl_stats = onmt.Loss.RLStatistics()
-        report_rl_stats = onmt.Loss.RLStatistics()
-
-        for i in range(len(trainData)):
-            batchIdx = batchOrder[i] if epoch > opt.curriculum else i
-            batch = trainData[batchIdx]
-            target_size = batch.tgt.size(0)
-
-            dec_state = None
-            trunc_size = opt.truncated_decoder if opt.truncated_decoder \
-                else target_size
-
-            if True and i % 5 == 0:
-                # model.zero_grad()
-                # mrtTrainer.train_batch(batch)
-                report_rl_stats = onmt.Loss.RLStatistics()
-                rl_stats = mrtTrainer.eval_batch(batch)
-                # mrtTrainer.step.temperature = max(0.5, math.exp(
-                #                             -3e-5*(epoch * len(trainData) + i)))
-                total_rl_stats.update(rl_stats)
-                report_rl_stats.update(rl_stats)
-                report_rl_stats.output(epoch, i+1, len(trainData),
-                                       total_rl_stats.start_time)
-            if len(opt.gpus):
-                batch.cuda(opt.gpus[0])
-            for j in range(0, target_size-1, trunc_size):
-                trunc_batch = batch.truncate(j, j + trunc_size)
-
-                # Main training loop
-                model.zero_grad()
-                outputs, attn, dec_state = model(trunc_batch.src,
-                                                 trunc_batch.tgt,
-                                                 trunc_batch.lengths,
-                                                 dec_state,
-                                                 largest_len=trunc_batch.lengths.data.max())
-
-                batch_stats, inputs, grads \
-                    = mem_loss.loss(trunc_batch, outputs, attn)
-
-                torch.autograd.backward(inputs, grads)
-                # for n, p in model.named_parameters():
-                #     print '%-40s: %10.10f' % (n, p.grad.data.sum())
-                # import pdb; pdb.set_trace()
-
-                # Update the parameters.
-                optim.step()
-                total_stats.update(batch_stats)
-                report_stats.update(batch_stats)
-                if dec_state is not None:
-                    dec_state.detach()
-
-            report_stats.n_src_words += batch.lengths.data.sum()
-
-            if i % opt.log_interval == -1 % opt.log_interval:
-                report_stats.output(epoch, i+1, len(trainData),
-                                    total_stats.start_time,
-                                    log_file=opt.log_file)
-
-                if opt.log_server:
-                    report_stats.log("progress", experiment, optim)
-                report_stats = onmt.Loss.Statistics()
-
-        return total_stats
+def trainModel(trainer):
 
     for epoch in range(opt.start_epoch, opt.epochs + 1):
         print('')
 
         #  (1) train for one epoch on the training set
-        train_stats = trainEpoch(epoch)
+        train_stats = trainer.train(epoch)
         print('Train perplexity: %g' % train_stats.ppl())
         print('Train accuracy: %g' % train_stats.accuracy())
         print('Train bleu: %g' % train_stats.bleu())
 
         #  (2) evaluate on the validation set
-        valid_stats = eval(model, criterion, validData)
+        valid_stats = trainer.validate()
         print('Validation perplexity: %g' % valid_stats.ppl())
         print('Validation accuracy: %g' % valid_stats.accuracy())
         print('Validation bleu: %g' % valid_stats.bleu())
 
         # Log to remote server.
         if opt.log_server:
-            train_stats.log("train", experiment, optim)
-            valid_stats.log("valid", experiment, optim)
+            train_stats.log("train", trainer.experiment, trainer.optim)
+            valid_stats.log("valid", trainer.experiment, trainer.optim)
 
         #  (3) update the learning rate
-        optim.updateLearningRate(valid_stats.ppl(), epoch)
-
-        model_state_dict = (model.module.state_dict() if len(opt.gpus) > 1
-                            else model.state_dict())
-        model_state_dict = {k: v for k, v in model_state_dict.items()
-                            if 'generator' not in k}
-        generator_state_dict = (model.generator.module.state_dict()
-                                if len(opt.gpus) > 1
-                                else model.generator.state_dict())
-        optim_state_dict = optim.optimizer.state_dict()
-        #  (4) drop a checkpoint
         if epoch >= opt.start_checkpoint_at:
-            checkpoint = {
-                'model': model_state_dict,
-                'generator': generator_state_dict,
-                'dicts': dataset['dicts'],
-                'opt': opt,
-                'epoch': epoch,
-                'optim': (optim, optim_state_dict)
-            }
-            torch.save(checkpoint,
-                       '%s_acc_%.2f_ppl_%.2f_e%d.pt'
-                       % (opt.save_model, valid_stats.accuracy(),
-                          valid_stats.ppl(), epoch))
+            trainer.drop_checkpoint(epoch, valid_stats)
 
 
 def main():
@@ -427,13 +324,22 @@ def main():
         model.load_state_dict(model_state_dict)
         generator.load_state_dict(generator_state_dict)
         opt.start_epoch = checkpoint['epoch'] + 1
-
-    if opt.train_from_state_dict:
+    elif opt.train_from_state_dict:
         print('Loading model from checkpoint at %s'
               % opt.train_from_state_dict)
         model.load_state_dict(checkpoint['model'])
         generator.load_state_dict(checkpoint['generator'])
         opt.start_epoch = checkpoint['epoch'] + 1
+    else:
+        if opt.param_init != 0.0:
+            print('Intializing params')
+            for p in model.parameters():
+                initParam(p, opt.init_method, opt.param_init)
+                # p.data.uniform_(-opt.param_init, opt.param_init)
+                # if len(p.size()) == 1:
+                #     p.data.fill_(1.0)
+                # else:
+                #     p.data.uniform_(-opt.param_init, opt.param_init)
 
     if len(opt.gpus) >= 1:
         model.cuda()
@@ -449,37 +355,27 @@ def main():
 
     model.generator = generator
 
+    optim = onmt.Optim(
+        opt.optim, opt.learning_rate, opt.max_grad_norm,
+        lr_decay=opt.learning_rate_decay,
+        start_decay_at=opt.start_decay_at,
+        momentum=opt.momentum,
+        beta1=opt.adam_beta1, beta2=opt.adam_beta2,
+        use_noam=(opt.decay_method == 'noam')
+    )
+
+    model.encoder.embeddings.load_pretrained_vectors(opt.pre_word_vecs_enc)
+    model.decoder.embeddings.load_pretrained_vectors(opt.pre_word_vecs_dec)
+
     optim_changed = False
-    if not opt.train_from_state_dict and not opt.train_from:
-        if opt.param_init != 0.0:
-            print('Intializing params')
-            for p in model.parameters():
-                p.data.uniform_(-opt.param_init, opt.param_init)
-                # if len(p.size()) == 1:
-                #     p.data.fill_(1.0)
-                # else:
-                #     p.data.uniform_(-opt.param_init, opt.param_init)
-
-        model.encoder.embeddings.load_pretrained_vectors(opt.pre_word_vecs_enc)
-        model.decoder.embeddings.load_pretrained_vectors(opt.pre_word_vecs_dec)
-
-        optim = onmt.Optim(
-            opt.optim, opt.learning_rate, opt.max_grad_norm,
-            lr_decay=opt.learning_rate_decay,
-            start_decay_at=opt.start_decay_at,
-            momentum=opt.momentum,
-            beta1=opt.adam_beta1, beta2=opt.adam_beta2,
-            opt=opt
-        )
-    else:
+    if opt.train_from_state_dict or opt.train_from:
         print('Loading optimizer from checkpoint:')
-        optim = checkpoint['optim'][0]
+        optim._step = checkpoint['optim']['step']
+        optim.method = checkpoint['optim']['method']
         if opt.learning_rate != parser.get_default('learning_rate'):
             optim.lr = opt.learning_rate
-            optim.optimizer.param_groups[0]['lr'] = optim.lr
         if opt.start_decay_at != parser.get_default('start_decay_at'):
             optim.start_decay_at = opt.start_decay_at
-            optim.start_decay = False
         if opt.optim != optim.method:
             print("Change optim method %s -> %s" % (optim.method, opt.optim))
             optim.method = opt.optim
@@ -489,7 +385,7 @@ def main():
     optim.set_parameters(model.parameters())
 
     if opt.train_from or opt.train_from_state_dict and not optim_changed:
-        optim.optimizer.load_state_dict(checkpoint['optim'][1])
+        optim.optimizer.load_state_dict(checkpoint['optim']['optim_state'])
 
     model_dirname = os.path.dirname(opt.save_model)
     if not os.path.exists(model_dirname):
@@ -497,6 +393,7 @@ def main():
     assert os.path.isdir(model_dirname), "%s not a directory" % opt.save_model
 
     # Set up the Crayon logging server.
+    experiment = None
     if opt.log_server != "":
         from pycrayon import CrayonClient
         cc = CrayonClient(hostname=opt.log_server)

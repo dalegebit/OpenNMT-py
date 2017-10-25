@@ -84,16 +84,16 @@ class BasicStatistics(object):
     """
     Template of Statistics
     """
-    def __init__(self, n_words=0, n_sents=0):
+    def __init__(self, n_words=0, n_sents=0, n_src_words=0):
         self.n_words = n_words
         self.n_sents = n_sents
-        self.n_src_words = 0
+        self.n_src_words = n_src_words
         self.start_time = time.time()
 
     def update_basic(self, stat):
         self.n_words += stat.n_words
-        self.n_correct += stat.n_correct
         self.n_sents += stat.n_sents
+        self.n_src_words += stat.n_src_words
 
     def log_basic(self, prefix, experiment, optim):
         t = self.elapsed_time()
@@ -145,7 +145,7 @@ class Statistics(BasicStatistics):
         sys.stdout.flush()
         if log_file:
             with open(log_file, 'a') as f:
-                print >> f, log_info
+                print(log_info, file=f)
 
     def log(self, prefix, experiment, optim):
         self.log_basic(prefix, experiment, optim)
@@ -269,11 +269,11 @@ class BleuScore:
         """
         Give sBLEU score
 
-        Inputs:
+        Args:
             pred_t: (n) interger list or (n*len) LongTensor Variable
             targ_t: (n*len) LongTensor Variable
 
-        Return:
+        Returns:
             bleus: (n) float list
         """
         bleus = []
@@ -353,11 +353,14 @@ class MemoryEfficientLoss:
                     "targ_t": batch.tgt[1:].transpose(0, 1).contiguous()}
 
         if self.coverage_loss:
-            original["coverage_t"] = attns["coverage"].transpose(0, 1).contiguous()
+            original["coverage_t"] = \
+                attns["coverage"].transpose(0, 1).contiguous()
 
         if self.copy_loss:
-            original["attn_t"] = attns["copy"].transpose(0, 1).contiguous()
-            original["align_t"] = batch.alignment[1:].transpose(0, 1).contiguous()
+            original["attn_t"] = \
+                attns["copy"].transpose(0, 1).contiguous()
+            original["align_t"] = \
+                batch.alignment[1:].transpose(0, 1).contiguous()
 
         shards, dummies = shardVariables(original, self.max_batches, self.eval)
 

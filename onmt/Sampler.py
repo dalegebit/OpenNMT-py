@@ -4,6 +4,9 @@ import torch.nn as nn
 from torch.autograd import Variable
 import onmt
 import onmt.modules
+from onmt.modules.Util import aeq
+
+import copy
 
 
 def sample_gumbel(type_template, size, eps=1e-20):
@@ -37,17 +40,77 @@ def gumbel_softmax(logits, temperature, hard=False):
     return y, y_max_ind
 
 
+def expand_variables(n_sample, n_src_per_batch, enc_state, context,
+                     emb, src, tgt, input):
+    """
+    Expand the variables in the batch dimension, which will be provided
+    for each sequence that is going to decode
+    """
+    # if only 1 source seq is given, we can simply use expand
+    if n_src_per_batch == 1:
+        enc_state.expandAsBatch_(n_sample)
+        context = context.expand(context.size(0), n_sample, context.size(2))
+        emb = emb.expand(emb.size(0), n_sample, emb.size(2))
+        src = src.expand(src.size(0), n_sample, src.size(2))
+        if tgt is not None:
+            tgt = tgt.expand(tgt.size(0), n_sample)
+        input = input.expand(input.size(0), n_sample)
+
+    #  if more than 1 source seq is given, we must use repeat
+    #  e.g.                                 [[1,2,3,4],
+    #        [[1,2,3,4],   repeat twice      [1,2,3,4],
+    #        [5,6,7,8]]      ---->           [5,6,7,8],
+    #                                        [5,6,7,8]]
+    else:
+        def _repeat(t, dim, b):
+            shape = [1] * (len(t.size())+1)
+            shape[dim+1] = b
+            view_shape = list(t.size())
+            view_shape[dim] *= b
+            return t.unsqueeze(dim+1).repeat(*shape).view(*view_shape)
+
+        enc_state.repeatAsBatch_(n_sample, _repeat)
+        context = _repeat(context, 1, n_sample)
+        emb = _repeat(emb, 1, n_sample)
+        src = _repeat(src, 1, n_sample)
+        if tgt is not None:
+            tgt = _repeat(tgt, 1, n_sample)
+        input = _repeat(input, 1, n_sample)
+
+    return enc_state, context, emb, src, tgt, input
+
+
+def update_paths(active_idx, cur_scores, cur_seqs, cur_states,
+                 return_state):
+    """
+    Select out the variables whose sequence is alive
+    """
+    # If some seqs are dead, update envionments for active ones
+    # for cur_seqs:
+    #       [[BOS, ..., EOS], (dead)
+    #        [BOS, ..., xx],  (alive)  -->  [[BOS, ..., xx]]
+    #        [BOS, ..., EOS]  (dead)]
+    new_scores = []
+    new_seqs = []
+    new_states = []
+    for b in active_idx:
+        new_scores.append(cur_scores[b])
+        new_seqs.append(cur_seqs[b])
+        if return_state:
+            new_states.append(cur_states[b])
+    return new_scores, new_seqs, new_states
+
+
 class Sampler(object):
     """
-    Very efficient sampler, can sample multiple samples for multiple
+    Very efficient sampler, can decode multiple sequences for multiple
     (as many as the gpu memory allows) inputs once
     """
 
-    def __init__(self, model, opt, scorer=None):
+    def __init__(self, model, opt):
         super(Sampler, self).__init__()
         self.model = model
         self.generator = model.generator
-        self.scorer = scorer
         self.use_gpu = len(opt.gpus) > 0
         self.multi_gpu = len(opt.gpus) > 1
         self.n_gram = opt.decoder_ngram
@@ -60,130 +123,148 @@ class Sampler(object):
         self.temperature = 1.0
         self.gumbel = False
 
-    def sample(self, n_sample, srcs, tgts, lengths, start_pos=1,
-               enc_states=None, contexts=None, embs=None,
-               largest_len=None, is_eval=False):
+    def sample(self, n_sample, srcs, lengths=None, start_pos=1, enc_states=None,
+               contexts=None, embs=None, inputs=None, prev_seqs=None, align=None,
+               tgts=None, scorer=None, is_eval=False, return_state=False):
 
-        ###################################################################
-        # 1. Encode enc_states if not given
+        # Encode enc_states if not given
         if enc_states is None or contexts is None:
             enc_states, contexts, embs = self.model.encoder(
-                srcs, lengths=lengths, largest_len=largest_len
+                srcs, lengths=lengths, align=align
             )
             enc_states = self.model.init_decoder_state(contexts, enc_states)
-            start_pos = 1
-            
+
         seqL, batch_size, rnn_size = contexts.size()
-        pad_masks = srcs[:, :, 0].data.eq(onmt.Constants.PAD).t()
 
         def mask(pad):
             self.model.decoder.attn.applyMask(pad)
 
+        def nones():
+            while True:
+                yield None
+
+        def split_list(l, n):
+            i = 0
+            while i < len(l):
+                yield l[i:i+n]
+                i += n
+
         # Returns
         all_seqs = []
         all_log_probs = []
-        all_probs = []  # softmax(log_prob)
-        all_bleus = []
+        all_metrics = []
+        all_states = []  # dec_states at every time step
+        all_contexts = []
+        all_embs = []
+        all_srcs = []
+        all_tgts = []
 
         n = self.max_num_seqs // n_sample  # batch per sample
 
-        ###################################################################
-        # 2. For each encoded source, decode multiple target seqs
-        for enc_state, context, emb, pad, src, tgt in \
-            zip(enc_states.split(n, 1, 0), contexts.split(n, 1),
-                embs.detach().split(n, 1), pad_masks.split(n, 0),
-                srcs.split(n, 1), tgts.split(n, 1)):
+        # For each encoded source, decode multiple target seqs
+        for enc_state, context, emb, src, tgt, input, prev_seq in \
+            zip(enc_states.split(n, 1, 0),
+                contexts.split(n, 1),
+                embs.detach().split(n, 1) if embs is not None else nones(),
+                srcs.split(n, 1),
+                tgts[1:].split(n, 1) if tgts is not None else nones(),
+                inputs.split(n, 1) if inputs is not None else nones(),
+                split_list(prev_seqs, n) if prev_seqs is not None else nones()):
+            ##################################################
             # a. Prepare anything for every sequence to sample
-            #  if only 1 source seq is given, we can simply use expand
-            if n == 1:
-                enc_state.expandAsBatch_(n_sample)
-                context = context.expand(seqL, n_sample, rnn_size)
-                emb = emb.expand(seqL, n_sample, rnn_size)
-                pad = pad.expand(n_sample, seqL)
-                tgt_t = tgt.t().expand(n_sample, tgt.size(0))
-                src = src.expand(src.size(0), n_sample, src.size(2))
-            #  if more than 1 source seq is given, we must use repeat
-            else:
-                def _repeat(t, dim, b):
-                    shape = [1] * (len(t.size())+1)
-                    shape[dim+1] = b
-                    view_shape = list(t.size())
-                    view_shape[dim] *= b
-                    return t.unsqueeze(dim+1).repeat(*shape).view(*view_shape)
+            ##################################################
+            if input is None:
+                input = Variable(src.data.new(1, src.size(1)).
+                                 fill_(onmt.Constants.BOS), volatile=is_eval)
+            aeq(input.size(0), 1)
 
-                enc_state.repeatAsBatch_(n_sample, _repeat)
-                context = _repeat(context, 1, n_sample)
-                emb = _repeat(emb, 1, n_sample)
-                pad = _repeat(pad, 0, n_sample)
-                tgt_t = _repeat(tgt.t(), 0, n_sample)
-                src = _repeat(src, 1, n_sample)
+            enc_state, context, emb, src, tgt, input = \
+                expand_variables(n_sample, n, enc_state, context, emb,
+                                 src, tgt, input)
+            tgt_t = tgt.t()
+
+            if tgt.size(1) != src.size(1):
+                print(tgts.size(), srcs.size())
+                print(tgt.size(), src.size())
+                import pdb; pdb.set_trace()
 
             max_len = int(self.max_len_ratio * lengths.data.max())+2
 
             dec_states = enc_state
+            pad = src[:, :, 0].data.eq(onmt.Constants.PAD).t()
 
             n_seqs = src.size(1)
-            result_seqs = [[onmt.Constants.BOS] for _ in range(n_seqs)]
-            accum_scores = [Variable(contexts.data.new([0]), volatile=is_eval)
-                            for _ in range(n_seqs)]
-            cur_seqs = result_seqs
-            cur_accum_scores = accum_scores
+            if prev_seqs is not None:
+                seqs = []
+                for seq in prev_seq:
+                    seqs.extend([copy.deepcopy(seq) for _ in range(n_sample)])
+            else:
+                seqs = [[] for _ in range(n_seqs)]
+            scores = [[] for _ in range(n_seqs)]
+            states = [[] for _ in range(n_seqs)]
 
-            input = Variable(tgt_t.data.new(1, n_seqs).
-                             fill_(onmt.Constants.BOS), volatile=is_eval)
+            cur_seqs = seqs
+            cur_scores = scores
+            cur_states = states
+
+            if return_state:
+                all_contexts.extend(context.split(1, 1))
+                if emb is not None:
+                    all_embs.extend(context.split(1, 1))
+                all_srcs.extend(src.split(1, 1))
+                if tgt is not None:
+                    all_tgts.extend(tgt.split(1, 1))
+
             n_old_active = n_seqs
             mask(pad.unsqueeze(0))
-
+            ###################
             # b. Begin Sampling
+            ###################
             for i in range(start_pos, max_len):
-                dec_out, dec_states, attn = self.model.decoder(input,
-                                                               src,
-                                                               context,
-                                                               dec_states,
-                                                               emb)
+
+                dec_out, dec_states, attn = \
+                    self.model.decoder(input, src, context, dec_states, emb)
 
                 dec_out = dec_out.squeeze(0)
                 out = self.generator.forward(dec_out)
                 if self.gumbel:
-                    onehots, pred_t = gumbel_softmax(out, self.temperature)
-                    pred_t = pred_t.unsqueeze(1)
+                    onehots, pred = gumbel_softmax(out, self.temperature)
+                    pred = pred.unsqueeze(1)
                     onehots = onehots.unsqueeze(0)
                 else:
-                    pred_t = out.exp().multinomial(1).detach()
+                    pred = out.exp().multinomial(1).detach()
 
-                active = Variable(pred_t.data.ne(onmt.Constants.EOS)
-                                             .squeeze().nonzero().squeeze(),
-                                  volatile=is_eval)
+                active = Variable(pred.data.ne(onmt.Constants.EOS)\
+                                  .squeeze().nonzero().squeeze(), volatile=is_eval)
 
-                score_t = out.gather(1, pred_t).squeeze(-1)
-                tokens = pred_t.squeeze().data
+                log_probs = out.gather(1, pred).squeeze(-1)
+                tokens = pred.squeeze().data
 
                 # Update scores and sequences
-                for i in range(len(cur_accum_scores)):
-                    cur_accum_scores[i] += score_t[i]
-                    cur_seqs[i].append(tokens[i])
+                for j, (score, token) in enumerate(zip(log_probs, tokens)):
+                    cur_scores[j].append(score)
+                    cur_seqs[j].append(token)
+                if return_state:
+                    for j, state in enumerate(dec_states.split(1, 1, 0)):
+                        cur_states[j].append(state)
 
                 # If none is active, then stop
                 if len(active.size()) == 0 or active.size(0) == 0:
                     break
 
                 if active.size(0) == n_old_active:
-                    input = onehots if self.gumbel else pred_t.t()
+                    input = onehots if self.gumbel else pred.t()
                     continue
 
                 n_old_active = active.size(0)
 
-                # If some seqs are dead, update envionments for active ones
-                new_accum_scores = []
-                new_seqs = []
-                for b in list(active.data):
-                    new_accum_scores.append(cur_accum_scores[b])
-                    new_seqs.append(cur_seqs[b])
-                cur_accum_scores = new_accum_scores
-                cur_seqs = new_seqs
+                cur_scores, cur_seqs, cur_states = \
+                    update_paths(list(active.data), cur_scores,
+                                 cur_seqs, cur_states, return_state)
 
+                # Select out the variables whose sequence is alive
                 input = onehots.index_select(1, active) \
-                    if self.gumbel else pred_t.t().index_select(1, active)
+                    if self.gumbel else pred.t().index_select(1, active)
                 src = src.index_select(1, active)
                 context = context.index_select(1, active)
                 emb = emb.index_select(1, active)
@@ -191,27 +272,30 @@ class Sampler(object):
                 mask(pad.unsqueeze(0))
                 dec_states.activeUpdate_(active)
                 if self.n_gram:
-                    for i, h in enumerate(self.model.decoder.rnn.histories):
-                        self.model.decoder.rnn.histories[i] = \
+                    for j, h in enumerate(self.model.decoder.rnn.histories):
+                        self.model.decoder.rnn.histories[j] = \
                             h.index_select(1, active)
-
+            ####################################
             # c. Calculate reward for this batch
+            ####################################
             if self.n_gram:
                 self.model.decoder.rnn.clear_histories()
-            accum_scores = torch.cat(accum_scores, 0)
-            prob = nn.functional.softmax(
-                        accum_scores.view(-1, n_sample)
-                   ).view(-1)
-            if self.scorer:
-                bleu = self.scorer.score(result_seqs, tgt_t)
-                bleu = Variable(accum_scores.data.new(bleu), volatile=is_eval)
-                all_bleus.append(bleu)
-            all_seqs.extend(result_seqs)
-            all_log_probs.append(accum_scores)
-            all_probs.append(prob)
+            if scorer and tgt_t is not None:
+                # print(len(seqs), tgt_t.size())
+                metrics = scorer.score(seqs, tgt_t)
+                all_metrics.extend(metrics)
+            all_seqs.extend(seqs)
+            all_log_probs.extend(scores)
+            if return_state:
+                all_states.extend(states)
 
         self.model.decoder.attn.removeMask()
-        all_log_probs = torch.cat(all_log_probs, 0)
-        all_probs = torch.cat(all_probs, 0)
-        all_bleus = torch.cat(all_bleus, 0)
-        return all_seqs, all_log_probs, all_probs, all_bleus
+
+        return {'seqs': all_seqs,
+                'log_probs': all_log_probs,
+                'metrics': all_metrics,
+                'states': all_states,
+                'contexts': all_contexts,
+                'embs': all_embs,
+                'src': all_srcs,
+                'tgt': all_tgts}
